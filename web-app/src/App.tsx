@@ -4,6 +4,9 @@ import { landmarks } from './data/landmarks';
 import { Gatekeeper } from './components/Gatekeeper';
 import { PassAndMarket } from './components/PassAndMarket';
 
+import ScannerView from './components/ScannerView';
+import ArchiveAndQuiz from './components/ArchiveAndQuiz';
+
 const STORAGE_KEY = 'frecventa77_state';
 
 const INITIAL_STATE: UserState = {
@@ -19,98 +22,6 @@ type ActiveTab = 'SCANNER' | 'ARCHIVE' | 'PASS' | 'MARKET';
 // ============================================================================
 // TEMPORARY PLACEHOLDER COMPONENTS (Allows immediate zero-error compilation)
 // ============================================================================
-
-interface ScannerViewProps {
-  landmarks: Landmark[];
-  unlockedIds: string[];
-  onUnlockSpot: (landmarkId: string) => void;
-}
-
-const ScannerView: React.FC<ScannerViewProps> = ({ landmarks, unlockedIds, onUnlockSpot }) => {
-  return (
-    <div className="border-2 border-[#EAE6DF] bg-[#141414] p-4 rounded-none space-y-4">
-      <div className="border-b-2 border-[#EAE6DF] pb-2 flex justify-between items-center">
-        <span className="text-xs font-bold uppercase tracking-widest text-[#33FF00]">
-          [OPTICAL RETICLE // STANDBY]
-        </span>
-        <span className="text-xs text-[#EAE6DF]/70">TRACK B MODULE</span>
-      </div>
-      <p className="text-sm text-[#EAE6DF]">
-        Scanner module placeholder active. Select a test node below to verify state engine binding:
-      </p>
-      <div className="space-y-2">
-        {landmarks.map((spot) => {
-          const isUnlocked = unlockedIds.includes(spot.id);
-          return (
-            <div
-              key={spot.id}
-              className="border-2 border-[#EAE6DF] p-3 flex items-center justify-between bg-[#0D0D0D]"
-            >
-              <div>
-                <div className="text-xs text-[#D9381E] font-bold uppercase">{spot.band}</div>
-                <div className="text-sm font-bold">{spot.title}</div>
-              </div>
-              <button
-                type="button"
-                disabled={isUnlocked}
-                onClick={() => onUnlockSpot(spot.id)}
-                className={`px-3 py-1.5 text-xs font-bold uppercase border-2 rounded-none ${
-                  isUnlocked
-                    ? 'border-[#33FF00] text-[#33FF00] bg-transparent cursor-default'
-                    : 'border-[#EAE6DF] bg-[#EAE6DF] text-[#0D0D0D] hover:bg-[#D9381E] hover:text-[#EAE6DF] hover:border-[#D9381E]'
-                }`}
-              >
-                {isUnlocked ? '[LOGGED]' : `[+ ${spot.points} PTS]`}
-              </button>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-};
-
-interface ArchiveAndQuizProps {
-  landmarks: Landmark[];
-  unlockedIds: string[];
-  quizCompleted: boolean;
-  onCompleteQuiz: (bonusPoints: number) => void;
-}
-
-const ArchiveAndQuiz: React.FC<ArchiveAndQuizProps> = ({
-  landmarks,
-  unlockedIds,
-  quizCompleted,
-  onCompleteQuiz,
-}) => {
-  return (
-    <div className="border-2 border-[#EAE6DF] bg-[#141414] p-4 rounded-none space-y-4">
-      <div className="border-b-2 border-[#EAE6DF] pb-2 flex justify-between items-center">
-        <span className="text-xs font-bold uppercase tracking-widest text-[#D9381E]">
-          [SAMIZDAT ARCHIVE & INTERROGATION]
-        </span>
-        <span className="text-xs text-[#EAE6DF]/70">
-          {unlockedIds.length}/{landmarks.length} TAPES
-        </span>
-      </div>
-      <p className="text-sm text-[#EAE6DF]">
-        Archive & Quiz module placeholder active.
-      </p>
-      <button
-        type="button"
-        disabled={quizCompleted}
-        onClick={() => onCompleteQuiz(100)}
-        className={`w-full py-2 text-xs font-bold uppercase border-2 rounded-none ${
-          quizCompleted
-            ? 'border-[#33FF00] text-[#33FF00] bg-[#0D0D0D]'
-            : 'border-[#D9381E] bg-[#D9381E] text-[#EAE6DF]'
-        }`}
-      >
-        {quizCompleted ? '[INTERROGATION CLEARED // +100 PTS]' : '[SIMULATE QUIZ COMPLETION (+100 PTS)]'}
-      </button>
-    </div>
-  );
-};
 
 // ============================================================================
 // MAIN APPLICATION STATE ENGINE (src/App.tsx)
