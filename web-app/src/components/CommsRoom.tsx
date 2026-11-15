@@ -1,1100 +1,1056 @@
-import { useEffect, useRef, useState } from "react";
-import { ensureAuth, supabase } from "../utils/supabaseClient";
-import { compressImageFile } from "../utils/geoAndHash";
-import { MarkdownBody } from "../utils/simpleMarkdown";
+import React, { useEffect, useState } from 'react';
+import { isKnownBandHandle } from '../utils/supabaseClient';
+import { AccountType } from '../types';
+import { HAS_REAL_SUPABASE, supabase } from '../utils/supabaseClient';
+import GigRadarMap, {
+  MapGigSummary,
+  TIMISOARA_REAL_VENUES,
+} from './GigRadarMap';
 
 interface CommsRoomProps {
   handle: string;
+  accountType: AccountType;
   points: number;
+  canPostForum: boolean;
+  hasBackstageClearance: boolean;
 }
 
-interface RawMessage {
+type ChannelId = 'GIGPROMO' | 'GEARSWAP' | 'LOSTTAPES' | 'SUBSOL89';
+
+interface ForumMessage {
   id: string;
-  nickname: string;
+  room_id: string;
+  sender_handle: string;
+  sender_role: AccountType;
+  headline?: string;
   content: string;
+  genre_tag?: string;
+  photos?: string[];
   created_at: string;
 }
 
-type PostTag = "DISCUSS" | "GIG / SHOW" | "RELEASE" | "GEAR" | "FOR SALE" | "TIPS";
-type RoomMode = "forum" | "chat";
-
-interface ParsedPost extends RawMessage {
-  isStructured: boolean;
-  tag: PostTag;
-  subject: string | null;
-  imageUrls: string[];
-  authorId: string | null;
-  body: string;
-}
-
-interface BoardChannel {
+interface PrivateRoom {
   code: string;
   name: string;
-  subtitle: string;
-  defaultMode: RoomMode;
+  createdBy: string;
 }
 
-const SECRET_GIG_ROOM = "SUBSOL89";
-const OWNED_POSTS_KEY = "frecventa77_owned_post_ids";
-const MAX_PHOTOS_PER_POST = 4;
+const LOCAL_MESSAGES_KEY = 'frecventa77_forum_messages_v2';
+const LOCAL_PRIVATE_ROOMS_KEY = 'frecventa77_private_rooms_v1';
 
-const OFFICIAL_BOARDS: BoardChannel[] = [
+const CHANNELS: { id: ChannelId; label: string; desc: string; restricted?: boolean }[] = [
+  { id: 'GIGPROMO', label: '#GIG-PROMO', desc: 'Timișoara underground shows, flyers & roadie calls' },
+  { id: 'GEARSWAP', label: '#GEAR-SWAP', desc: 'Amps, pedals, reel-to-reel tapes & schematics' },
+  { id: 'LOSTTAPES', label: '#LOST-TAPES', desc: '1962–2026 Timișoara bootlegs, zines & archive lore' },
   {
-    code: "GIGPROMO",
-    name: "BAND GIGS, RELEASES & LINEUPS",
-    subtitle: "Promote local underground shows, EPs & open slots",
-    defaultMode: "forum",
-  },
-  {
-    code: "GEARSWAP",
-    name: "GEAR SETUPS & SWAP / SELL",
-    subtitle: "Multi-photo rig rundowns, pedals, amps & secondhand gear",
-    defaultMode: "forum",
-  },
-  {
-    code: "DIYTECHS",
-    name: "SOUND TIPS & DIY TECH",
-    subtitle: "Rehearsal rooms, wiring hacks, zine printing & mixing tips",
-    defaultMode: "forum",
-  },
-  {
-    code: "FREQ0077",
-    name: "GENERAL SCENE BOARD",
-    subtitle: "Timișoara rock community discussions & announcements",
-    defaultMode: "forum",
+    id: 'SUBSOL89',
+    label: '#SUBSOL-89 [VIP]',
+    desc: 'Deep-cover backstage frequency (requires Heavy-85 clearance or Band role)',
+    restricted: true,
   },
 ];
 
-function parseForumPost(msg: RawMessage): ParsedPost {
-  // Format: [TAG:GEAR|SUBJ:My Pedalboard|IMGS:url1,url2]\nMarkdown body...
-  // Also backwards-compatible with single |IMG:url
-  const match = msg.content.match(
-    /^\[TAG:(DISCUSS|GIG \/ SHOW|RELEASE|GEAR|FOR SALE|TIPS)\|SUBJ:([^|\]]*)(?:\|(?:IMGS|IMG):([^|\]]*))?(?:\|UID:([^\]]*))?\]\n([\s\S]*)$/
-  );
-  if (match) {
-    const rawImgs = match[3]?.trim() || "";
-    // Support comma-separated URLs while keeping data:image/...;base64,... intact
-    const imageUrls = rawImgs
-      ? rawImgs
-          .split(/,(?=https?:\/\/|data:image\/)/)
-          .map((u) => u.trim())
-          .filter(Boolean)
-      : [];
+const SEEDED_MESSAGES: ForumMessage[] = [
+  {
+    id: 'seed-gig-1',
+    room_id: 'GIGPROMO',
+    sender_handle: 'zgomot_subteran',
+    sender_role: 'BAND',
+    genre_tag: 'POST-PUNK',
+    headline: 'TONIGHT 21:00 @ MANUFACTURA // LIVE SESSION + ROADIE CALL',
+    content:
+      '**ZGOMOT SUBTERAN** + opening act tonight in Fabric.\n> Doors 20:30 • Free entry for crew\n- Need 2 roadies for 18:30 amp load-in (Code: **AMP77**)\n- Cassettes & hand-printed patches at merch desk',
+    created_at: '2026-11-15T18:00:00Z',
+  },
+  {
+    id: 'seed-gig-2',
+    room_id: 'GIGPROMO',
+    sender_handle: 'halaciuga_tm',
+    sender_role: 'BAND',
+    genre_tag: 'GARAGE ROCK',
+    headline: "FRIDAY 21:30 @ D'ARC PE MAL // BEGA FUZZ NIGHT",
+    content:
+      'Raw garage & fuzz session right by the Bega canal.\n> Bring earplugs & old C-90 tapes for live board dubbing.',
+    created_at: '2026-11-15T17:15:00Z',
+  },
+  {
+    id: 'seed-gear-1',
+    room_id: 'GEARSWAP',
+    sender_handle: 'amp_doctor_tm',
+    sender_role: 'OPERATIVE',
+    genre_tag: 'TUBE / DIY',
+    headline: 'TESLA MONO 50 & SOVTEK MUFF SCHEMATICS + SPARE TUBES',
+    content:
+      'Have 2 matched **EL34** pairs and a modded Big Muff clone ready for trade.\n- Looking for a working spring reverb tank or 4-track cassette deck in Timișoara.',
+    created_at: '2026-11-15T14:20:00Z',
+  },
+  {
+    id: 'seed-tapes-1',
+    room_id: 'LOSTTAPES',
+    sender_handle: 'frecventa77',
+    sender_role: 'ADMIN',
+    genre_tag: '1973 ARCHIVE',
+    headline: 'PROGRESIV TM — UNRELEASED PARCUL ROZELOR REHEARSAL REEL',
+    content:
+      '# SAMIZDAT TAPE LOG #04\nDigitized from a 1973 reel found in Elisabetin.\n> "The amps were custom-wound from radio transformers."',
+    created_at: '2026-11-15T11:05:00Z',
+  },
+  {
+    id: 'seed-priv-1',
+    room_id: 'PRIV:BUNKER77',
+    sender_handle: 'frecventa77',
+    sender_role: 'ADMIN',
+    headline: 'ENCRYPTED BACKSTAGE LINE // BUNKER77',
+    content:
+      'Private band & crew frequency active. Share your room code (**BUNKER77**) with bandmates or sound engineers.',
+    created_at: '2026-11-15T10:00:00Z',
+  },
+];
 
-    return {
-      ...msg,
-      isStructured: true,
-      tag: match[1] as PostTag,
-      subject: match[2].trim() || null,
-      imageUrls,
-      authorId: match[4]?.trim() || null,
-      body: match[5],
-    };
-  }
-  return {
-    ...msg,
-    isStructured: false,
-    tag: "DISCUSS",
-    subject: null,
-    imageUrls: [],
-    authorId: null,
-    body: msg.content,
-  };
-}
+const UPCOMING_CALENDAR_GIGS: (MapGigSummary & { dateLabel: string; venueName: string })[] = [
+  {
+    id: 'cal-1',
+    date: '2026-11-15',
+    dateLabel: 'TONIGHT // 21:00',
+    venueId: 'manufactura',
+    venueName: 'MANUFACTURA',
+    band: 'Zgomot Subteran',
+    genre: 'POST-PUNK',
+    title: 'Zgomot Subteran Live @ Manufactura',
+    time: '21:00',
+  },
+  {
+    id: 'cal-2',
+    date: '2026-11-20',
+    dateLabel: 'FRI 20 NOV // 21:30',
+    venueId: 'darc',
+    venueName: "D'ARC PE MAL",
+    band: 'Hălăciugă',
+    genre: 'GARAGE FUZZ',
+    title: "Bega Fuzz Session @ D'arc pe Mal",
+    time: '21:30',
+  },
+  {
+    id: 'cal-3',
+    date: '2026-11-21',
+    dateLabel: 'SAT 21 NOV // 20:00',
+    venueId: 'reflektor',
+    venueName: 'REFLEKTOR VENUE',
+    band: 'Timișoara 1973–2026 Collective',
+    genre: 'PROG / HEAVY',
+    title: 'Progresiv TM & Cargo Tribute Night',
+    time: '20:00',
+  },
+  {
+    id: 'cal-4',
+    date: '2026-11-26',
+    dateLabel: 'THU 26 NOV // 20:30',
+    venueId: 'casatineretului',
+    venueName: 'CASA TINERETULUI',
+    band: 'Subsol 89 Showcase',
+    genre: 'ALT / EXPERIMENTAL',
+    title: 'Underground Tape & Synth Showcase',
+    time: '20:30',
+  },
+];
 
-function generateRoomCode(): string {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  const bytes = new Uint8Array(8);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes)
-    .map((b) => chars[b % chars.length])
-    .join("");
-}
-
-async function uploadPostImage(file: File): Promise<string> {
-  await ensureAuth();
-  const compressedDataUrl = await compressImageFile(file, 720);
-  const res = await fetch(compressedDataUrl);
-  const blob = await res.blob();
-
-  const filePath = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}.jpg`;
-  const { error } = await supabase.storage
-    .from("post-images")
-    .upload(filePath, blob, { contentType: "image/jpeg", upsert: false });
-
-  if (error) {
-    // Compact fallback if storage bucket isn't configured yet
-    return await compressImageFile(file, 260);
-  }
-
-  const { data } = supabase.storage.from("post-images").getPublicUrl(filePath);
-  return data.publicUrl;
-}
-
-export default function CommsRoom({ handle, points }: CommsRoomProps) {
-  const nickname = (handle || "LISTENER").trim().slice(0, 24);
-  const canAccessSecretRoom = points >= 150;
-
-  const [activeRoomCode, setActiveRoomCode] = useState<string | null>(null);
-  const [activeRoomTitle, setActiveRoomTitle] = useState<string>("");
-  const [roomMode, setRoomMode] = useState<RoomMode>("forum");
-  const [joinInput, setJoinInput] = useState("");
-  const [customCodeInput, setCustomCodeInput] = useState("");
-  const [lobbyStatus, setLobbyStatus] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
-  const [connStatus, setConnStatus] = useState("OFFLINE");
-  const [messages, setMessages] = useState<RawMessage[]>([]);
-  const [onlineUsers, setOnlineUsers] = useState<string[]>([]);
-  const [filterTag, setFilterTag] = useState<PostTag | "ALL">("ALL");
-  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
-
-  // Track IDs of posts created from this device
-  const [ownedPostIds, setOwnedPostIds] = useState<string[]>(() => {
-    try {
-      const saved = localStorage.getItem(OWNED_POSTS_KEY);
-      return saved ? (JSON.parse(saved) as string[]) : [];
-    } catch {
-      return [];
+function renderInlineBold(text: string): React.ReactNode[] {
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((part, idx) => {
+    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+      return (
+        <strong key={idx} className="text-[#33FF00] font-bold">
+          {part.slice(2, -2)}
+        </strong>
+      );
     }
+    return <React.Fragment key={idx}>{part}</React.Fragment>;
+  });
+}
+
+function RichSamizdatBody({ content }: { content: string }) {
+  const lines = content.split('\n');
+  return (
+    <div className="space-y-1.5 text-xs leading-relaxed text-[#EAE6DF]/90">
+      {lines.map((line, i) => {
+        const trimmed = line.trim();
+        if (!trimmed) return <div key={i} className="h-1" />;
+        if (trimmed.startsWith('# ')) {
+          return (
+            <div
+              key={i}
+              className="text-sm sm:text-base font-bold uppercase tracking-wide text-[#33FF00] border-b border-[#33FF00]/40 pb-0.5"
+            >
+              {trimmed.slice(2)}
+            </div>
+          );
+        }
+        if (trimmed.startsWith('## ')) {
+          return (
+            <div key={i} className="text-xs sm:text-sm font-bold uppercase text-[#EAE6DF]">
+              {trimmed.slice(3)}
+            </div>
+          );
+        }
+        if (trimmed.startsWith('> ')) {
+          return (
+            <blockquote
+              key={i}
+              className="border-l-2 border-[#D9381E] bg-black/60 pl-2.5 py-1 text-[11px] italic text-[#EAE6DF]/85"
+            >
+              {renderInlineBold(trimmed.slice(2))}
+            </blockquote>
+          );
+        }
+        if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
+          return (
+            <div key={i} className="flex items-start gap-1.5 pl-1">
+              <span className="text-[#33FF00] font-bold">▪</span>
+              <span>{renderInlineBold(trimmed.slice(2))}</span>
+            </div>
+          );
+        }
+        return <p key={i}>{renderInlineBold(line)}</p>;
+      })}
+    </div>
+  );
+}
+
+async function compressForumPhoto(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const maxSide = 720;
+        const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+        const w = Math.max(1, Math.round(img.width * scale));
+        const h = Math.max(1, Math.round(img.height * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return reject(new Error('Canvas unavailable'));
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/jpeg', 0.72));
+      };
+      img.onerror = () => reject(new Error('Image decode error'));
+      img.src = String(reader.result || '');
+    };
+    reader.onerror = () => reject(new Error('File read error'));
+    reader.readAsDataURL(file);
+  });
+}
+
+export default function CommsRoom({
+  handle,
+  accountType,
+  canPostForum: canPostForumProp,
+  hasBackstageClearance: hasBackstageProp,
+}: CommsRoomProps) {
+  const isBandOrAdminRole =
+    ['BAND', 'ARTIST', 'ADMIN'].includes(String(accountType || '').toUpperCase()) ||
+    isKnownBandHandle(handle || '');
+  const canPostForum = Boolean(canPostForumProp || isBandOrAdminRole);
+  const hasBackstageClearance = Boolean(hasBackstageProp || isBandOrAdminRole);
+  const [viewMode, setViewMode] = useState<'FORUMS' | 'PRIVATE' | 'RADAR'>('FORUMS');
+  const [activeChannel, setActiveChannel] = useState<ChannelId>('GIGPROMO');
+  const [selectedVenueFilter, setSelectedVenueFilter] = useState<string>('ALL');
+
+  // Private small chat rooms
+  const [privateRooms, setPrivateRooms] = useState<PrivateRoom[]>(() => {
+    let base: PrivateRoom[] = [
+      { code: 'BUNKER77', name: 'TIMIȘOARA SOUNDCHECK & CREW', createdBy: 'frecventa77' },
+    ];
+    try {
+      const saved = JSON.parse(localStorage.getItem(LOCAL_PRIVATE_ROOMS_KEY) || 'null');
+      if (Array.isArray(saved) && saved.length > 0) base = saved;
+    } catch {
+      // ignore
+    }
+    if (hasBackstageClearance && !base.some((r) => r.code === 'SUBSOL89')) {
+      base = [
+        ...base,
+        { code: 'SUBSOL89', name: 'SUBSOL-89 VIP BACKSTAGE FREQUENCY', createdBy: 'frecventa77' },
+      ];
+    }
+    return base;
   });
 
   useEffect(() => {
-    localStorage.setItem(OWNED_POSTS_KEY, JSON.stringify(ownedPostIds));
-  }, [ownedPostIds]);
-
-  // Forum Post Composer
-  const [showComposer, setShowComposer] = useState(false);
-  const [previewMarkdown, setPreviewMarkdown] = useState(false);
-  const [postTag, setPostTag] = useState<PostTag>("GEAR");
-  const [postSubject, setPostSubject] = useState("");
-  const [postBody, setPostBody] = useState("");
-  const [postPhotoFiles, setPostPhotoFiles] = useState<File[]>([]);
-  const [postPhotoPreviews, setPostPhotoPreviews] = useState<string[]>([]);
-  const [deletingId, setDeletingId] = useState<string | null>(null);
-
-  // Live Chat Quick Input
-  const [chatDraft, setChatDraft] = useState("");
-  const [sending, setSending] = useState(false);
-
-  const roomIdRef = useRef<string | null>(null);
-  const sessionIdRef = useRef<string>(crypto.randomUUID());
-  const chatBottomRef = useRef<HTMLDivElement>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-
-  async function enterRoom(
-    codeToJoin: string,
-    title = "",
-    autoCreateIfMissing = false,
-    mode: RoomMode = "chat"
-  ) {
-    const cleanCode = codeToJoin.trim().toUpperCase();
-    if (!/^[A-Z0-9]{8}$/.test(cleanCode)) {
-      setLobbyStatus("[X] ROOM / BOARD CODE MUST BE 8 ALPHANUMERIC CHARS.");
-      return;
+    if (hasBackstageClearance) {
+      setPrivateRooms((prev) =>
+        prev.some((r) => r.code === 'SUBSOL89')
+          ? prev
+          : [
+              ...prev,
+              { code: 'SUBSOL89', name: 'SUBSOL-89 VIP BACKSTAGE FREQUENCY', createdBy: 'frecventa77' },
+            ]
+      );
     }
+  }, [hasBackstageClearance]);
+  const [activePrivateCode, setActivePrivateCode] = useState<string>('BUNKER77');
+  const [newRoomName, setNewRoomName] = useState('');
+  const [joinCodeInput, setJoinCodeInput] = useState('');
+  const [copiedCode, setCopiedCode] = useState(false);
 
-    setBusy(true);
-    setLobbyStatus(">> TUNING FREQUENCY...");
-
+  // Messages store
+  const [messages, setMessages] = useState<ForumMessage[]>(() => {
     try {
-      let { data: room, error } = await supabase
-        .from("rooms")
-        .select("id, room_code")
-        .eq("room_code", cleanCode)
-        .maybeSingle();
-
-      if (error) throw error;
-
-      if (!room && autoCreateIfMissing) {
-        const user = await ensureAuth();
-        const inserted = await supabase
-          .from("rooms")
-          .insert({ room_code: cleanCode, owner_id: user.id })
-          .select("id, room_code")
-          .single();
-        if (inserted.error) throw inserted.error;
-        room = inserted.data;
-      }
-
-      if (!room) {
-        setLobbyStatus(`[X] FREQUENCY ${cleanCode} NOT FOUND.`);
-        return;
-      }
-
-      roomIdRef.current = room.id;
-      setLobbyStatus(null);
-      setActiveRoomTitle(title || `LIVE ROOM ${cleanCode}`);
-      setRoomMode(mode);
-      setFilterTag("ALL");
-      setShowComposer(false);
-      setPreviewMarkdown(false);
-      setActiveRoomCode(cleanCode);
-    } catch (err) {
-      console.error(err);
-      setLobbyStatus("[X] DATABASE CONNECTION ERROR.");
-    } finally {
-      setBusy(false);
+      const saved = JSON.parse(localStorage.getItem(LOCAL_MESSAGES_KEY) || 'null');
+      if (Array.isArray(saved) && saved.length > 0) return saved;
+    } catch {
+      // ignore
     }
-  }
+    return SEEDED_MESSAGES;
+  });
 
-  async function handleCreateRoom() {
-    const custom = customCodeInput.trim().toUpperCase();
-    if (custom && !/^[A-Z0-9]{8}$/.test(custom)) {
-      setLobbyStatus("[X] CUSTOM CODE MUST BE EXACTLY 8 LETTERS OR NUMBERS.");
-      return;
-    }
-
-    setBusy(true);
-    setLobbyStatus(">> ALLOCATING LIVE CHATROOM...");
-
-    try {
-      const user = await ensureAuth();
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const code = custom || generateRoomCode();
-        const { data, error } = await supabase
-          .from("rooms")
-          .insert({ room_code: code, owner_id: user.id })
-          .select("id, room_code")
-          .single();
-
-        if (!error && data) {
-          roomIdRef.current = data.id;
-          setLobbyStatus(null);
-          setActiveRoomTitle(`LIVE ROOM ${data.room_code}`);
-          setRoomMode("chat");
-          setActiveRoomCode(data.room_code);
-          return;
-        }
-        if (error?.code === "23505" && custom) {
-          setLobbyStatus("[X] ROOM CODE ALREADY TAKEN.");
-          return;
-        }
-      }
-      setLobbyStatus("[X] COULD NOT ALLOCATE ROOM.");
-    } catch (err) {
-      console.error(err);
-      setLobbyStatus("[X] AUTH / DB ERROR.");
-    } finally {
-      setBusy(false);
-    }
-  }
+  // Rich bulletin composer state
+  const [headline, setHeadline] = useState('');
+  const [genreTag, setGenreTag] = useState('LIVE GIG');
+  const [draft, setDraft] = useState('');
+  const [draftPhotos, setDraftPhotos] = useState<string[]>([]);
+  const [lightboxPhoto, setLightboxPhoto] = useState<string | null>(null);
+  const [showPreview, setShowPreview] = useState(false);
+  const [privateDraft, setPrivateDraft] = useState('');
 
   useEffect(() => {
-    if (!activeRoomCode || !roomIdRef.current) return;
+    localStorage.setItem(LOCAL_MESSAGES_KEY, JSON.stringify(messages));
+  }, [messages]);
 
-    const currentRoomId = roomIdRef.current;
-    const sessionId = sessionIdRef.current;
-    let cancelled = false;
-    supabase.auth.getUser().then(({ data }) => {
-      if (!cancelled) setCurrentUserId(data.user?.id ?? null);
-    });
+  useEffect(() => {
+    localStorage.setItem(LOCAL_PRIVATE_ROOMS_KEY, JSON.stringify(privateRooms));
+  }, [privateRooms]);
 
-    setConnStatus("CONNECTING...");
-    setMessages([]);
-    setOnlineUsers([]);
-
-    const channel = supabase.channel(`room:${currentRoomId}`, {
-      config: { presence: { key: sessionId } },
-    });
-
-    channel
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "messages",
-          filter: `room_id=eq.${currentRoomId}`,
-        },
-        (payload) => {
-          const incoming = payload.new as RawMessage;
-          setMessages((prev) =>
-            prev.some((m) => m.id === incoming.id) ? prev : [...prev, incoming]
-          );
+  // Load Supabase messages if available
+  useEffect(() => {
+    if (!HAS_REAL_SUPABASE) return;
+    supabase
+      .from('forum_messages')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(80)
+      .then(({ data }) => {
+        if (Array.isArray(data) && data.length > 0) {
+          setMessages((prev) => {
+            const ids = new Set(data.map((d: any) => d.id));
+            return [...(data as ForumMessage[]), ...prev.filter((m) => !ids.has(m.id))];
+          });
         }
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "DELETE",
-          schema: "public",
-          table: "messages",
-        },
-        (payload) => {
-          const deletedId = (payload.old as { id?: string })?.id;
-          if (deletedId) {
-            setMessages((prev) => prev.filter((m) => m.id !== deletedId));
-          }
-        }
-      )
-      .on("presence", { event: "sync" }, () => {
-        const state = channel.presenceState<{ nickname?: string; session_id?: string }>();
-        const users = Object.values(state).flat();
-
-        const duplicate = users.some(
-          (u) =>
-            u.nickname?.toLowerCase() === nickname.toLowerCase() &&
-            u.session_id !== sessionId
-        );
-
-        if (duplicate && !cancelled) {
-          setLobbyStatus(`[X] HANDLE @${nickname} ALREADY ACTIVE IN ROOM.`);
-          setActiveRoomCode(null);
-          return;
-        }
-
-        const names = users.map((u) => u.nickname || "ANON");
-        setOnlineUsers(Array.from(new Set(names)));
       });
+  }, []);
 
-    channel.subscribe(async (status) => {
-      if (cancelled) return;
-      if (status === "SUBSCRIBED") {
-        await channel.track({ nickname, session_id: sessionId });
-        setConnStatus("LIVE");
+  function appendFormatToken(token: string) {
+    setDraft((prev) => (prev ? `${prev}\n${token}` : token));
+  }
 
-        const { data: history } = await supabase
-          .from("messages")
-          .select("id, nickname, content, created_at")
-          .eq("room_id", currentRoomId)
-          .order("created_at", { ascending: true })
-          .limit(120);
-
-        if (!cancelled && history) {
-          setMessages(history);
-        }
-      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-        setConnStatus("SIGNAL LOST");
+  async function handleSelectForumPhotos(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    const remainingSlots = Math.max(0, 5 - draftPhotos.length);
+    const slice = files.slice(0, remainingSlots);
+    const compressed: string[] = [];
+    for (const file of slice) {
+      try {
+        compressed.push(await compressForumPhoto(file));
+      } catch {
+        // skip unreadable image
       }
-    });
+    }
+    if (compressed.length > 0) {
+      setDraftPhotos((prev) => [...prev, ...compressed].slice(0, 5));
+    }
+    e.target.value = '';
+  }
 
-    return () => {
-      cancelled = true;
-      void supabase.removeChannel(channel);
+  async function handlePostForum(e: React.FormEvent) {
+    e.preventDefault();
+    if (!draft.trim()) return;
+    if (activeChannel === 'SUBSOL89' && !hasBackstageClearance) return;
+
+    const msg: ForumMessage = {
+      id: `msg-${Date.now()}`,
+      room_id: activeChannel,
+      sender_handle: handle || 'operative',
+      sender_role: accountType,
+      headline: headline.trim().toUpperCase() || undefined,
+      genre_tag: genreTag.trim().toUpperCase() || undefined,
+      photos: draftPhotos.length > 0 ? draftPhotos : undefined,
+      content: draft.trim(),
+      created_at: new Date().toISOString(),
     };
-  }, [activeRoomCode, nickname]);
 
-  useEffect(() => {
-    if (roomMode === "chat") {
-      chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    setMessages((prev) => [msg, ...prev]);
+    setHeadline('');
+    setDraft('');
+    setDraftPhotos([]);
+    setShowPreview(false);
+
+    if (HAS_REAL_SUPABASE) {
+      await supabase.from('forum_messages').insert({
+        room_id: msg.room_id,
+        sender_handle: msg.sender_handle,
+        sender_role: msg.sender_role,
+        content: msg.headline ? `# ${msg.headline}\n${msg.content}` : msg.content,
+      });
     }
-  }, [messages, roomMode]);
-
-  function handleSelectPostPhotos(e: React.ChangeEvent<HTMLInputElement>) {
-    const selectedFiles = Array.from(e.target.files ?? []);
-    if (selectedFiles.length === 0) return;
-
-    const remainingSlots = MAX_PHOTOS_PER_POST - postPhotoFiles.length;
-    const accepted = selectedFiles.slice(0, remainingSlots);
-
-    setPostPhotoFiles((prev) => [...prev, ...accepted]);
-    setPostPhotoPreviews((prev) => [
-      ...prev,
-      ...accepted.map((f) => URL.createObjectURL(f)),
-    ]);
-    e.target.value = "";
   }
 
-  function removeDraftPhoto(index: number) {
-    setPostPhotoFiles((prev) => prev.filter((_, i) => i !== index));
-    setPostPhotoPreviews((prev) => prev.filter((_, i) => i !== index));
-  }
-
-  function applyMarkdownSnippet(prefix: string, suffix = "", placeholder = "text") {
-    const el = textareaRef.current;
-    if (!el) {
-      setPostBody((prev) => `${prev}${prefix}${placeholder}${suffix}`);
-      return;
-    }
-    const start = el.selectionStart;
-    const end = el.selectionEnd;
-    const selected = postBody.slice(start, end) || placeholder;
-    const next =
-      postBody.slice(0, start) + prefix + selected + suffix + postBody.slice(end);
-    setPostBody(next);
-    requestAnimationFrame(() => {
-      el.focus();
-      el.setSelectionRange(start + prefix.length, start + prefix.length + selected.length);
-    });
-  }
-
-  async function handlePublishForumPost(e: React.FormEvent) {
+  function handleCreatePrivateRoom(e: React.FormEvent) {
     e.preventDefault();
-    const cleanBody = postBody.trim();
-    const cleanSubject = postSubject.trim().replace(/[\]|]/g, "");
-    if (!cleanBody || !roomIdRef.current || sending) return;
-
-    setSending(true);
-    try {
-      const uploadedUrls: string[] = [];
-      for (const file of postPhotoFiles) {
-        const url = await uploadPostImage(file);
-        uploadedUrls.push(url);
-      }
-
-      const user = await ensureAuth();
-      const uidPart = `|UID:${user.id}`;
-      const header =
-        uploadedUrls.length > 0
-          ? `[TAG:${postTag}|SUBJ:${cleanSubject}|IMGS:${uploadedUrls.join(",")}${uidPart}]`
-          : `[TAG:${postTag}|SUBJ:${cleanSubject}${uidPart}]`;
-
-      const encodedContent = `${header}\n${cleanBody}`;
-
-      const { data, error } = await supabase
-        .from("messages")
-        .insert({
-          room_id: roomIdRef.current,
-          nickname,
-          content: encodedContent.slice(0, 4000),
-        })
-        .select("id")
-        .single();
-
-      if (error) throw error;
-      if (data?.id) {
-        setOwnedPostIds((prev) => [...prev, data.id]);
-      }
-
-      setPostSubject("");
-      setPostBody("");
-      setPostPhotoFiles([]);
-      setPostPhotoPreviews([]);
-      setPreviewMarkdown(false);
-      setShowComposer(false);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setSending(false);
-    }
+    const code = `TM${Math.floor(1000 + Math.random() * 8999)}`;
+    const room: PrivateRoom = {
+      code,
+      name: newRoomName.trim().toUpperCase() || `PIRATE FREQ ${code}`,
+      createdBy: handle || 'operative',
+    };
+    setPrivateRooms((prev) => [room, ...prev]);
+    setActivePrivateCode(code);
+    setNewRoomName('');
   }
 
-  async function handleDeletePost(postId: string) {
-    if (deletingId) return;
-    setDeletingId(postId);
-    try {
-      await ensureAuth();
-      const { error } = await supabase.from("messages").delete().eq("id", postId);
-      if (error) throw error;
-      setMessages((prev) => prev.filter((m) => m.id !== postId));
-      setOwnedPostIds((prev) => prev.filter((id) => id !== postId));
-    } catch (err) {
-      console.error("Failed to delete post:", err);
-      alert("Could not delete post from database. Check DELETE RLS policy on messages.");
-    } finally {
-      setDeletingId(null);
-    }
-  }
-
-  async function handleSendChatMessage(e: React.FormEvent) {
+  function handleJoinPrivateRoom(e: React.FormEvent) {
     e.preventDefault();
-    const clean = chatDraft.trim();
-    if (!clean || !roomIdRef.current || sending) return;
+    const clean = joinCodeInput.trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
+    if (!clean) return;
+    if (!privateRooms.some((r) => r.code === clean)) {
+      setPrivateRooms((prev) => [
+        { code: clean, name: `ENCRYPTED CHANNEL // ${clean}`, createdBy: 'INVITE' },
+        ...prev,
+      ]);
+    }
+    setActivePrivateCode(clean);
+    setJoinCodeInput('');
+  }
 
-    setSending(true);
-    try {
-      const { data, error } = await supabase
-        .from("messages")
-        .insert({
-          room_id: roomIdRef.current,
-          nickname,
-          content: clean.slice(0, 600),
-        })
-        .select("id")
-        .single();
-      if (error) throw error;
-      if (data?.id) {
-        setOwnedPostIds((prev) => [...prev, data.id]);
-      }
-      setChatDraft("");
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setSending(false);
+  async function handleSendPrivateMessage(e: React.FormEvent) {
+    e.preventDefault();
+    if (!privateDraft.trim() || !activePrivateCode) return;
+    const roomKey = `PRIV:${activePrivateCode}`;
+    const msg: ForumMessage = {
+      id: `priv-${Date.now()}`,
+      room_id: roomKey,
+      sender_handle: handle || 'operative',
+      sender_role: accountType,
+      content: privateDraft.trim(),
+      created_at: new Date().toISOString(),
+    };
+    setMessages((prev) => [msg, ...prev]);
+    setPrivateDraft('');
+
+    if (HAS_REAL_SUPABASE) {
+      await supabase.from('forum_messages').insert({
+        room_id: roomKey,
+        sender_handle: msg.sender_handle,
+        sender_role: msg.sender_role,
+        content: msg.content,
+      });
     }
   }
 
-  // LOBBY VIEW
-  if (!activeRoomCode) {
-    return (
-      <div className="space-y-4 font-mono text-[#EAE6DF]">
-        <div className="flex items-center justify-between border-b-2 border-[#EAE6DF] pb-2">
-          <h2 className="text-lg font-bold uppercase tracking-widest">// Forum &amp; Live Comms</h2>
-          <span className="text-xs text-[#33FF00]">@{nickname}</span>
-        </div>
+  const channelMeta = CHANNELS.find((c) => c.id === activeChannel)!;
+  const channelMessages = messages.filter((m) => m.room_id === activeChannel);
+  const privateRoomMessages = messages
+    .filter((m) => m.room_id === `PRIV:${activePrivateCode}`)
+    .slice()
+    .reverse();
 
-        <div className="space-y-2">
-          <div className="text-[11px] font-bold uppercase text-[#33FF00]">
-            1. SAMIZDAT FORUM BOARDS (MARKDOWN + MULTI-PHOTO):
-          </div>
+  const visibleCalendarGigs =
+    selectedVenueFilter === 'ALL'
+      ? UPCOMING_CALENDAR_GIGS
+      : UPCOMING_CALENDAR_GIGS.filter((g) => g.venueId === selectedVenueFilter);
 
-          {OFFICIAL_BOARDS.map((board) => (
+  return (
+    <div className="space-y-4 font-mono text-[#EAE6DF]">
+      {/* Header & Top Mode Switcher */}
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b-2 border-[#EAE6DF] pb-2">
+        <h2 className="text-base sm:text-lg font-bold uppercase tracking-wider">
+          // SUBSOL COMMS &amp; GIG RADAR
+        </h2>
+        <div className="flex items-center gap-1">
+          {(
+            [
+              ['FORUMS', 'ZINE FORUMS'],
+              ['PRIVATE', `PRIVATE ROOMS (${privateRooms.length})`],
+              ['RADAR', 'MAP & CALENDAR'],
+            ] as const
+          ).map(([mode, label]) => (
             <button
-              key={board.code}
+              key={mode}
               type="button"
-              disabled={busy}
-              onClick={() => enterRoom(board.code, board.name, true, board.defaultMode)}
-              className="flex w-full items-center justify-between border-2 border-[#EAE6DF] bg-[#141414] p-3 text-left hover:border-[#33FF00]"
+              onClick={() => setViewMode(mode)}
+              className={`px-2 py-1 text-[10px] font-bold uppercase border ${
+                viewMode === mode
+                  ? 'border-[#33FF00] bg-[#33FF00] text-[#0D0D0D]'
+                  : 'border-[#EAE6DF]/40 bg-[#141414] text-[#EAE6DF]'
+              }`}
             >
-              <div>
-                <div className="text-xs sm:text-sm font-bold uppercase text-[#33FF00]">
-                  [{board.code}] {board.name}
-                </div>
-                <div className="text-[11px] text-[#EAE6DF]/70">{board.subtitle}</div>
-              </div>
-              <span className="ml-2 whitespace-nowrap text-xs font-bold uppercase">
-                &gt;&gt; BOARD
-              </span>
+              {label}
             </button>
           ))}
         </div>
+      </div>
 
-        <div className="space-y-2 border-t-2 border-[#EAE6DF]/40 pt-3">
-          <div className="text-[11px] font-bold uppercase text-[#D9381E]">
-            2. SMALL LIVE CHATROOMS (CONCERTS &amp; BACKSTAGE):
-          </div>
-
-          <button
-            type="button"
-            disabled={busy || !canAccessSecretRoom}
-            onClick={() => enterRoom(SECRET_GIG_ROOM, "SUBSOL89 LIVE GIG CHAT", true, "chat")}
-            className="flex w-full items-center justify-between border-2 border-[#EAE6DF] bg-[#141414] p-3 text-left disabled:opacity-45"
-          >
-            <div>
-              <div className="text-xs sm:text-sm font-bold uppercase text-[#D9381E]">
-                [{canAccessSecretRoom ? SECRET_GIG_ROOM : "LOCKED"}] SECRET GIG LIVE CHAT
-              </div>
-              <div className="text-[11px] text-[#EAE6DF]/70">
-                {canAccessSecretRoom
-                  ? "Clearance verified // Real-time gig coordination & door drops"
-                  : "Requires 150 PTS (Unlock 1 scan node to reveal live room)"}
-              </div>
-            </div>
-            <span className="ml-2 whitespace-nowrap text-xs font-bold uppercase">
-              {canAccessSecretRoom ? ">> CHAT" : "[LOCKED]"}
-            </span>
-          </button>
-
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              void enterRoom(joinInput, "", false, "chat");
-            }}
-            className="space-y-2 border-2 border-[#EAE6DF] bg-[#141414] p-3"
-          >
-            <label className="block text-xs font-bold uppercase">
-              JOIN SMALL ROOM BY 8-CHAR CODE:
-            </label>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                maxLength={8}
-                value={joinInput}
-                onChange={(e) => setJoinInput(e.target.value.toUpperCase())}
-                placeholder="EX: SUBSOL89"
-                className="flex-1 rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-sm uppercase text-[#EAE6DF]"
-              />
+      {/* MODE 1: BIG TEXT FORMATTING SAMIZDAT FORUMS */}
+      {viewMode === 'FORUMS' && (
+        <div className="space-y-4">
+          {/* Channel Tabs */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+            {CHANNELS.map((ch) => (
               <button
-                type="submit"
-                disabled={busy}
-                className="rounded-none border-2 border-[#EAE6DF] bg-[#D9381E] px-4 text-xs font-bold uppercase text-[#EAE6DF]"
-              >
-                JOIN
-              </button>
-            </div>
-          </form>
-
-          <div className="space-y-2 border-2 border-dashed border-[#EAE6DF]/50 bg-[#141414] p-3">
-            <div className="text-xs font-bold uppercase">CREATE PRIVATE 8-CHAR CHATROOM:</div>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                maxLength={8}
-                value={customCodeInput}
-                onChange={(e) => setCustomCodeInput(e.target.value.toUpperCase())}
-                placeholder="OPTIONAL 8-CHAR CODE"
-                className="flex-1 rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs uppercase text-[#EAE6DF]"
-              />
-              <button
+                key={ch.id}
                 type="button"
-                disabled={busy}
-                onClick={handleCreateRoom}
-                className="rounded-none border-2 border-[#EAE6DF] bg-[#EAE6DF] px-3 text-xs font-bold uppercase text-[#0D0D0D]"
+                onClick={() => setActiveChannel(ch.id)}
+                className={`p-2 text-left border-2 ${
+                  activeChannel === ch.id
+                    ? 'border-[#33FF00] bg-[#141414] text-[#33FF00]'
+                    : 'border-[#EAE6DF]/30 bg-[#0D0D0D] text-[#EAE6DF]/75'
+                }`}
               >
-                CREATE ROOM
+                <div className="text-[10px] font-bold uppercase">{ch.label}</div>
               </button>
-            </div>
+            ))}
           </div>
-        </div>
 
-        {lobbyStatus && (
-          <p className="border border-[#D9381E] bg-[#141414] p-2 text-xs uppercase text-[#D9381E]">
-            {lobbyStatus}
-          </p>
-        )}
-      </div>
-    );
-  }
-
-  const parsedPosts = messages.map(parseForumPost);
-  const forumPosts = [...parsedPosts]
-    .reverse()
-    .filter((p) => (filterTag === "ALL" ? true : p.tag === filterTag));
-
-  const tagBadgeStyle: Record<PostTag, string> = {
-    "GIG / SHOW": "border-[#D9381E] bg-[#D9381E] text-[#EAE6DF]",
-    RELEASE: "border-[#33FF00] bg-[#33FF00] text-[#0D0D0D]",
-    DISCUSS: "border-[#EAE6DF] text-[#EAE6DF]",
-    GEAR: "border-[#33FF00] text-[#33FF00]",
-    "FOR SALE": "border-[#D9381E] text-[#D9381E]",
-    TIPS: "border-[#EAE6DF]/70 text-[#EAE6DF]/90",
-  };
-
-  function isPostAuthor(post: ParsedPost): boolean {
-    if (post.authorId && currentUserId) {
-      return post.authorId === currentUserId;
-    }
-    return ownedPostIds.includes(post.id);
-  }
-
-  return (
-    <div className="flex flex-col space-y-3 font-mono text-[#EAE6DF]">
-      {/* Header + Mode Switcher */}
-      <div className="flex items-center justify-between gap-2 border-b-2 border-[#EAE6DF] pb-2">
-        <div>
-          <div className="text-[10px] uppercase text-[#EAE6DF]/60">{activeRoomTitle}</div>
-          <div className="flex items-center gap-2">
-            <strong className="text-base tracking-widest text-[#33FF00]">{activeRoomCode}</strong>
-            <span className="text-[10px] uppercase text-[#EAE6DF]/70">[{connStatus}]</span>
+          <div className="border-l-2 border-[#33FF00] pl-2.5 text-[11px] text-[#EAE6DF]/75">
+            {channelMeta.desc}
           </div>
-        </div>
 
-        <div className="flex items-center gap-1.5">
-          <button
-            type="button"
-            onClick={() => setRoomMode((m) => (m === "forum" ? "chat" : "forum"))}
-            className="border border-[#33FF00] px-2 py-1 text-[10px] font-bold uppercase text-[#33FF00]"
-          >
-            {roomMode === "forum" ? "LIVE CHAT" : "FORUM VIEW"}
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveRoomCode(null)}
-            className="border border-[#D9381E] px-2 py-1 text-xs font-bold uppercase text-[#D9381E]"
-          >
-            &lt;- EXIT
-          </button>
-        </div>
-      </div>
-
-      {/* Online Listeners Strip */}
-      <div className="flex flex-wrap items-center gap-1.5 border border-[#EAE6DF]/30 bg-[#141414] px-2.5 py-1.5 text-[11px]">
-        <span className="text-[#33FF00]">● {onlineUsers.length} ONLINE:</span>
-        {onlineUsers.map((u) => (
-          <span key={u} className="bg-black px-1.5 py-0.5 text-[#EAE6DF]">
-            @{u}
-          </span>
-        ))}
-      </div>
-
-      {/* MODE A: SMALL LIVE CHATROOM */}
-      {roomMode === "chat" ? (
-        <>
-          <div className="h-[52vh] space-y-2 overflow-y-auto border-2 border-[#EAE6DF] bg-[#141414] p-3 text-xs">
-            {parsedPosts.length === 0 ? (
-              <p className="italic text-[#EAE6DF]/50">
-                &gt;&gt; Frequency open. Say something as @{nickname}...
+          {activeChannel === 'SUBSOL89' && !hasBackstageClearance ? (
+            <div className="border-2 border-[#D9381E] bg-[#141414] p-4 text-xs space-y-1">
+              <div className="font-bold uppercase text-[#D9381E]">
+                [FREQUENCY ENCRYPTED // CLEARANCE REQUIRED]
+              </div>
+              <p className="text-[#EAE6DF]/80">
+                Complete the <strong>HEAVY-85</strong> archive quiz or log in with a verified Band
+                account to unlock #SUBSOL-89 backstage comms.
               </p>
-            ) : (
-              parsedPosts.map((m) => {
-                const isMe = isPostAuthor(m);
-                return (
-                  <div key={m.id} className="leading-relaxed">
-                    <span className="text-[#EAE6DF]/40">
-                      [
-                      {new Date(m.created_at).toLocaleTimeString([], {
-                        hour: "2-digit",
-                        minute: "2-digit",
-                      })}
-                      ]{" "}
+            </div>
+          ) : (
+            <>
+              {/* Big Text Samizdat Bulletin Composer */}
+              {canPostForum ? (
+                <form
+                  onSubmit={handlePostForum}
+                  className="border-2 border-[#EAE6DF] bg-[#141414] p-3.5 space-y-2.5"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-bold uppercase text-[#33FF00]">
+                      // BROADCAST SAMIZDAT BULLETIN TO {channelMeta.label}
                     </span>
-                    <span className={isMe ? "font-bold text-[#D9381E]" : "font-bold text-[#33FF00]"}>
-                      &lt;{m.nickname}&gt;
-                    </span>{" "}
-                    {m.subject && <strong className="uppercase">[{m.subject}] </strong>}
-                    <span className="break-words">{m.body}</span>
-                    {isMe && (
-                      <button
-                        type="button"
-                        onClick={() => handleDeletePost(m.id)}
-                        className="ml-2 text-[10px] uppercase text-[#D9381E] underline"
-                      >
-                        [x]
-                      </button>
-                    )}
-                    {m.imageUrls.length > 0 && (
-                      <div className="mt-1.5 flex flex-wrap gap-1.5">
-                        {m.imageUrls.map((url, idx) => (
-                          <img
-                            key={idx}
-                            src={url}
-                            alt="attachment"
-                            onClick={() => setLightboxUrl(url)}
-                            className="max-h-36 cursor-pointer border border-[#EAE6DF]/40 object-contain"
-                          />
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                );
-              })
-            )}
-            <div ref={chatBottomRef} />
-          </div>
-
-          <form onSubmit={handleSendChatMessage} className="flex gap-2">
-            <input
-              type="text"
-              maxLength={500}
-              value={chatDraft}
-              onChange={(e) => setChatDraft(e.target.value)}
-              placeholder={`Message ${activeRoomCode} as @${nickname}...`}
-              className="flex-1 rounded-none border-2 border-[#EAE6DF] bg-[#141414] p-2.5 text-sm text-[#EAE6DF]"
-            />
-            <button
-              type="submit"
-              disabled={sending || connStatus !== "LIVE"}
-              className="rounded-none border-2 border-[#EAE6DF] bg-[#D9381E] px-4 text-xs font-bold uppercase text-[#EAE6DF] disabled:opacity-40"
-            >
-              SEND
-            </button>
-          </form>
-        </>
-      ) : (
-        /* MODE B: STRUCTURED FORUM WITH MARKDOWN + MULTI-PHOTO + DELETE */
-        <>
-          <div className="space-y-2">
-            <button
-              type="button"
-              onClick={() => setShowComposer((prev) => !prev)}
-              className="w-full rounded-none border-2 border-[#EAE6DF] bg-[#D9381E] p-2.5 text-xs font-bold uppercase tracking-wider text-[#EAE6DF]"
-            >
-              {showComposer ? "[- CLOSE POST EDITOR]" : "[+ NEW FORUM POST / MULTI-PHOTO]"}
-            </button>
-
-            {showComposer && (
-              <form
-                onSubmit={handlePublishForumPost}
-                className="space-y-2.5 border-2 border-[#EAE6DF] bg-[#141414] p-3"
-              >
-                <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-                  <div>
-                    <label className="mb-1 block text-[10px] uppercase text-[#EAE6DF]/70">
-                      CATEGORY
-                    </label>
-                    <select
-                      value={postTag}
-                      onChange={(e) => setPostTag(e.target.value as PostTag)}
-                      className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs uppercase text-[#EAE6DF]"
+                    <button
+                      type="button"
+                      onClick={() => setShowPreview((p) => !p)}
+                      className="border border-[#EAE6DF]/50 px-2 py-0.5 text-[9px] font-bold uppercase text-[#EAE6DF]"
                     >
-                      <option value="GEAR">GEAR SETUP</option>
-                      <option value="FOR SALE">FOR SALE / SWAP</option>
-                      <option value="GIG / SHOW">GIG / SHOW</option>
-                      <option value="RELEASE">NEW RELEASE</option>
-                      <option value="TIPS">TIPS &amp; DIY</option>
-                      <option value="DISCUSS">DISCUSS</option>
-                    </select>
+                      {showPreview ? '[EDIT RAW]' : '[LIVE PREVIEW]'}
+                    </button>
                   </div>
 
-                  <div className="sm:col-span-2">
-                    <label className="mb-1 block text-[10px] uppercase text-[#EAE6DF]/70">
-                      HEADLINE / ITEM OR GIG TITLE
-                    </label>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                     <input
                       type="text"
-                      maxLength={90}
-                      value={postSubject}
-                      onChange={(e) => setPostSubject(e.target.value)}
-                      placeholder="EX: CUSTOM PEDALBOARD / LANEY AMP FOR SALE"
-                      className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
+                      value={headline}
+                      onChange={(e) => setHeadline(e.target.value)}
+                      placeholder="BIG BULLETIN HEADLINE..."
+                      className="sm:col-span-2 border border-[#EAE6DF] bg-black p-2 text-xs font-bold uppercase text-[#EAE6DF]"
+                    />
+                    <input
+                      type="text"
+                      value={genreTag}
+                      onChange={(e) => setGenreTag(e.target.value)}
+                      placeholder="TAG (E.G. GIG / AMP)"
+                      className="border border-[#EAE6DF]/60 bg-black p-2 text-xs uppercase text-[#33FF00]"
                     />
                   </div>
-                </div>
 
-                {/* Markdown Formatting Toolbar + Preview Toggle */}
-                <div>
-                  <div className="mb-1 flex flex-wrap items-center justify-between gap-1">
-                    <span className="text-[10px] uppercase text-[#EAE6DF]/70">
-                      MARKDOWN BODY *
-                    </span>
-                    <div className="flex flex-wrap gap-1">
-                      <button
-                        type="button"
-                        onClick={() => applyMarkdownSnippet("**", "**", "bold")}
-                        className="border border-[#EAE6DF]/40 bg-black px-1.5 py-0.5 text-[10px] font-bold"
-                      >
-                        B
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => applyMarkdownSnippet("*", "*", "italic")}
-                        className="border border-[#EAE6DF]/40 bg-black px-1.5 py-0.5 text-[10px] italic"
-                      >
-                        I
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => applyMarkdownSnippet("## ", "", "SPECS")}
-                        className="border border-[#EAE6DF]/40 bg-black px-1.5 py-0.5 text-[10px]"
-                      >
-                        H2
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => applyMarkdownSnippet("- ", "", "item")}
-                        className="border border-[#EAE6DF]/40 bg-black px-1.5 py-0.5 text-[10px]"
-                      >
-                        LIST
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => applyMarkdownSnippet("> ", "", "quote")}
-                        className="border border-[#EAE6DF]/40 bg-black px-1.5 py-0.5 text-[10px]"
-                      >
-                        QUOTE
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => applyMarkdownSnippet("`", "`", "150 RON")}
-                        className="border border-[#EAE6DF]/40 bg-black px-1.5 py-0.5 text-[10px] text-[#33FF00]"
-                      >
-                        TAG
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setPreviewMarkdown((p) => !p)}
-                        className={`border px-1.5 py-0.5 text-[10px] font-bold uppercase ${
-                          previewMarkdown
-                            ? "border-[#33FF00] bg-[#33FF00] text-[#0D0D0D]"
-                            : "border-[#33FF00] text-[#33FF00]"
-                        }`}
-                      >
-                        {previewMarkdown ? "EDIT" : "PREVIEW"}
-                      </button>
-                    </div>
+                  {/* Formatting Toolbar */}
+                  <div className="flex flex-wrap items-center gap-1 border border-[#EAE6DF]/30 bg-black p-1.5">
+                    <span className="text-[9px] uppercase text-[#EAE6DF]/60 mr-1">FORMAT:</span>
+                    <button
+                      type="button"
+                      onClick={() => appendFormatToken('# BIG BANNER')}
+                      className="border border-[#EAE6DF]/40 px-1.5 py-0.5 text-[10px] font-bold text-[#33FF00]"
+                    >
+                      H1 BIG
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => appendFormatToken('## SUBHEAD')}
+                      className="border border-[#EAE6DF]/40 px-1.5 py-0.5 text-[10px] font-bold"
+                    >
+                      H2
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => appendFormatToken('**BOLD TEXT**')}
+                      className="border border-[#EAE6DF]/40 px-1.5 py-0.5 text-[10px] font-bold"
+                    >
+                      **BOLD**
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => appendFormatToken('> VENUE / TIME CALLOUT')}
+                      className="border border-[#EAE6DF]/40 px-1.5 py-0.5 text-[10px]"
+                    >
+                      &gt; QUOTE
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => appendFormatToken('- SETLIST / GEAR ITEM')}
+                      className="border border-[#EAE6DF]/40 px-1.5 py-0.5 text-[10px]"
+                    >
+                      - LIST
+                    </button>
                   </div>
 
-                  {previewMarkdown ? (
-                    <div className="min-h-[84px] border-2 border-[#33FF00]/60 bg-black p-2.5">
-                      {postBody.trim() ? (
-                        <MarkdownBody content={postBody} />
-                      ) : (
-                        <span className="text-xs italic text-[#EAE6DF]/50">
-                          Nothing to preview yet...
-                        </span>
+                  {showPreview ? (
+                    <div className="border border-[#33FF00]/60 bg-black p-3 space-y-1.5">
+                      {headline && (
+                        <div className="text-sm sm:text-base font-bold uppercase text-[#EAE6DF]">
+                          {headline}
+                        </div>
                       )}
+                      <RichSamizdatBody content={draft || '_Nothing drafted yet..._'} />
                     </div>
                   ) : (
                     <textarea
-                      ref={textareaRef}
                       rows={4}
-                      maxLength={1400}
+                      value={draft}
+                      onChange={(e) => setDraft(e.target.value)}
+                      placeholder="Write formatted gig promo, gear listing, or archive story (# Big Header, **bold**, > callout, - bullet)..."
+                      className="w-full border border-[#EAE6DF] bg-black p-2.5 text-xs text-[#EAE6DF] leading-relaxed"
                       required
-                      value={postBody}
-                      onChange={(e) => setPostBody(e.target.value)}
-                      placeholder={`Supports **bold**, *italic*, ## headings, - bullet lists, > quotes & links...`}
-                      className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
-                    />
-                  )}
-                </div>
-
-                {/* Multi-Photo Picker (Up to 4 photos) */}
-                <div>
-                  <div className="mb-1 flex items-center justify-between text-[10px] uppercase text-[#EAE6DF]/70">
-                    <span>
-                      PHOTOS ({postPhotoFiles.length}/{MAX_PHOTOS_PER_POST}):
-                    </span>
-                    {postPhotoFiles.length > 0 && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setPostPhotoFiles([]);
-                          setPostPhotoPreviews([]);
-                        }}
-                        className="text-[#D9381E] underline"
-                      >
-                        CLEAR ALL
-                      </button>
-                    )}
-                  </div>
-
-                  {postPhotoFiles.length < MAX_PHOTOS_PER_POST && (
-                    <input
-                      type="file"
-                      accept="image/*"
-                      multiple
-                      onChange={handleSelectPostPhotos}
-                      className="w-full border-2 border-[#EAE6DF] bg-black p-1.5 text-[11px] text-[#EAE6DF]"
                     />
                   )}
 
-                  {postPhotoPreviews.length > 0 && (
-                    <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
-                      {postPhotoPreviews.map((src, idx) => (
-                        <div
-                          key={idx}
-                          className="relative border border-[#33FF00] bg-black p-1"
-                        >
-                          <img
-                            src={src}
-                            alt={`Upload ${idx + 1}`}
-                            className="h-24 w-full object-cover"
+                  {/* Photo Attachments (Max 5 per post) */}
+                  <div className="border border-[#EAE6DF]/30 bg-black/70 p-2 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-bold uppercase text-[#EAE6DF]/80">
+                        ZINE PHOTOS ({draftPhotos.length}/5 MAX)
+                      </span>
+                      {draftPhotos.length < 5 && (
+                        <label className="cursor-pointer border border-[#33FF00] bg-[#141414] px-2 py-0.5 text-[10px] font-bold uppercase text-[#33FF00]">
+                          + ADD PHOTOS
+                          <input
+                            type="file"
+                            accept="image/*"
+                            multiple
+                            onChange={handleSelectForumPhotos}
+                            className="hidden"
                           />
-                          <button
-                            type="button"
-                            onClick={() => removeDraftPhoto(idx)}
-                            className="absolute right-1 top-1 border border-[#EAE6DF] bg-[#D9381E] px-1.5 py-0.5 text-[10px] font-bold text-[#EAE6DF]"
-                          >
-                            X
-                          </button>
-                        </div>
-                      ))}
+                        </label>
+                      )}
                     </div>
-                  )}
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={sending || connStatus !== "LIVE"}
-                  className="w-full rounded-none border-2 border-[#EAE6DF] bg-[#33FF00] p-2 text-xs font-bold uppercase tracking-wider text-[#0D0D0D] disabled:opacity-40"
-                >
-                  {sending
-                    ? `UPLOADING ${postPhotoFiles.length} PHOTO(S)...`
-                    : "PUBLISH POST TO BOARD"}
-                </button>
-              </form>
-            )}
-
-            <div className="flex flex-wrap gap-1.5 pt-1">
-              {(
-                ["ALL", "GEAR", "FOR SALE", "GIG / SHOW", "RELEASE", "TIPS", "DISCUSS"] as const
-              ).map((tag) => (
-                <button
-                  key={tag}
-                  type="button"
-                  onClick={() => setFilterTag(tag)}
-                  className={`border px-2 py-1 text-[10px] font-bold uppercase ${
-                    filterTag === tag
-                      ? "border-[#33FF00] bg-[#33FF00] text-[#0D0D0D]"
-                      : "border-[#EAE6DF]/40 bg-[#141414] text-[#EAE6DF]/80"
-                  }`}
-                >
-                  {tag}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="space-y-2.5">
-            {forumPosts.length === 0 ? (
-              <div className="border-2 border-dashed border-[#EAE6DF]/30 bg-[#141414] p-4 text-xs italic text-[#EAE6DF]/60">
-                &gt;&gt; No dispatches under [{filterTag}] yet. Hit [+ NEW FORUM POST] to post first.
-              </div>
-            ) : (
-              forumPosts.map((post) => {
-                const canDelete = isPostAuthor(post);
-                return (
-                  <article
-                    key={post.id}
-                    className="space-y-2 border-2 border-[#EAE6DF] bg-[#141414] p-3"
-                  >
-                    <div className="flex items-center justify-between gap-2 border-b border-[#EAE6DF]/20 pb-1.5">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span
-                          className={`border px-1.5 py-0.5 text-[10px] font-bold uppercase ${
-                            tagBadgeStyle[post.tag]
-                          }`}
-                        >
-                          {post.tag}
-                        </span>
-                        <span className="text-xs font-bold text-[#33FF00]">@{post.nickname}</span>
-                      </div>
-
-                      <div className="flex items-center gap-2">
-                        <span className="whitespace-nowrap text-[10px] text-[#EAE6DF]/50">
-                          {new Date(post.created_at).toLocaleString("ro-RO", {
-                            month: "short",
-                            day: "2-digit",
-                            hour: "2-digit",
-                            minute: "2-digit",
-                          })}
-                        </span>
-                        {canDelete && (
-                          <button
-                            type="button"
-                            disabled={deletingId === post.id}
-                            onClick={() => handleDeletePost(post.id)}
-                            className="border border-[#D9381E] px-1.5 py-0.5 text-[10px] font-bold uppercase text-[#D9381E] hover:bg-[#D9381E] hover:text-[#EAE6DF]"
-                          >
-                            {deletingId === post.id ? "..." : "DELETE"}
-                          </button>
-                        )}
-                      </div>
-                    </div>
-
-                    {post.subject && (
-                      <h3 className="text-sm font-bold uppercase text-[#EAE6DF]">{post.subject}</h3>
-                    )}
-
-                    {/* Multi-Photo Grid */}
-                    {post.imageUrls.length > 0 && (
-                      <div
-                        className={`grid gap-2 ${
-                          post.imageUrls.length === 1 ? "grid-cols-1" : "grid-cols-2"
-                        }`}
-                      >
-                        {post.imageUrls.map((url, idx) => (
-                          <img
+                    {draftPhotos.length > 0 && (
+                      <div className="grid grid-cols-5 gap-1.5">
+                        {draftPhotos.map((src, idx) => (
+                          <div
                             key={idx}
-                            src={url}
-                            alt={`${post.subject || "Post"} photo ${idx + 1}`}
-                            onClick={() => setLightboxUrl(url)}
-                            className="max-h-64 w-full cursor-pointer border border-[#EAE6DF]/40 bg-black object-cover hover:border-[#33FF00]"
-                          />
+                            className="relative aspect-square border border-[#33FF00]/60 bg-black overflow-hidden"
+                          >
+                            <img
+                              src={src}
+                              alt={`Attachment ${idx + 1}`}
+                              className="h-full w-full object-cover"
+                            />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setDraftPhotos((prev) => prev.filter((_, i) => i !== idx))
+                              }
+                              className="absolute top-0.5 right-0.5 bg-black/85 border border-[#D9381E] px-1 text-[9px] font-bold text-[#D9381E]"
+                            >
+                              X
+                            </button>
+                          </div>
                         ))}
                       </div>
                     )}
+                  </div>
 
-                    <MarkdownBody content={post.body} />
+                  <button
+                    type="submit"
+                    className="w-full border-2 border-[#EAE6DF] bg-[#33FF00] p-2 text-xs font-bold uppercase text-[#0D0D0D]"
+                  >
+                    TRANSMIT BULLETIN TO {channelMeta.label}
+                  </button>
+                </form>
+              ) : (
+                <div className="border border-dashed border-[#EAE6DF]/40 bg-[#141414] p-2.5 text-[11px] text-[#EAE6DF]/75">
+                  [READ-ONLY] Scan 2 landmarks, complete 1 volunteer shift, or pass GENESIS-62 to
+                  broadcast on public zine channels (Private Rooms remain open!).
+                </div>
+              )}
+
+              {/* Forum Thread Feed */}
+              <div className="space-y-3">
+                {channelMessages.map((msg) => {
+                  const isBandPost =
+                    msg.sender_role === 'BAND' ||
+                    msg.sender_role === 'ARTIST' ||
+                    isKnownBandHandle(msg.sender_handle);
+                  const isAdminPost = msg.sender_role === 'ADMIN';
+                  const cardTone = isAdminPost
+                    ? 'border-2 border-[#33FF00] border-l-4 bg-[#101C10] shadow-[0_0_12px_rgba(51,255,0,0.12)]'
+                    : isBandPost
+                    ? 'border-2 border-[#D9381E] border-l-4 bg-[#1B1110] shadow-[0_0_12px_rgba(217,56,30,0.14)]'
+                    : 'border-2 border-[#EAE6DF]/45 bg-[#141414]';
+                  return (
+                  <article
+                    key={msg.id}
+                    className={`${cardTone} p-3.5 space-y-2`}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#EAE6DF]/20 pb-1.5">
+                      <div className="flex items-center gap-1.5">
+                        <span
+                          className={`text-xs font-bold ${
+                            isAdminPost
+                              ? 'text-[#33FF00]'
+                              : isBandPost
+                              ? 'text-[#FF6B52]'
+                              : 'text-[#EAE6DF]'
+                          }`}
+                        >
+                          @{msg.sender_handle}
+                        </span>
+                        <span
+                          className={`px-1.5 py-0.5 text-[9px] font-bold uppercase ${
+                            isAdminPost
+                              ? 'bg-[#33FF00] text-[#0D0D0D]'
+                              : isBandPost
+                              ? 'bg-[#D9381E] text-[#EAE6DF]'
+                              : 'bg-[#EAE6DF]/20 text-[#EAE6DF]'
+                          }`}
+                        >
+                          {isAdminPost
+                            ? '⚡ SYSOP // ADMIN'
+                            : isBandPost
+                            ? '★ VERIFIED BAND'
+                            : msg.sender_role}
+                        </span>
+                      </div>
+                      {msg.genre_tag && (
+                        <span className="border border-[#EAE6DF]/40 px-1.5 py-0.5 text-[9px] font-bold uppercase text-[#EAE6DF]/80">
+                          {msg.genre_tag}
+                        </span>
+                      )}
+                    </div>
+
+                    {msg.headline && (
+                      <h3 className="text-sm sm:text-base font-bold uppercase tracking-wide text-[#EAE6DF]">
+                        {msg.headline}
+                      </h3>
+                    )}
+
+                    <RichSamizdatBody content={msg.content} />
+
+                    {Array.isArray(msg.photos) && msg.photos.length > 0 && (
+                      <div
+                        className={`grid gap-1.5 pt-1 ${
+                          msg.photos.length === 1
+                            ? 'grid-cols-1'
+                            : msg.photos.length === 2
+                            ? 'grid-cols-2'
+                            : 'grid-cols-3'
+                        }`}
+                      >
+                        {msg.photos.slice(0, 5).map((photoSrc, pIdx) => (
+                          <button
+                            key={pIdx}
+                            type="button"
+                            onClick={() => setLightboxPhoto(photoSrc)}
+                            className="group relative overflow-hidden border border-[#EAE6DF]/40 bg-black focus:outline-none"
+                          >
+                            <img
+                              src={photoSrc}
+                              alt={`Bulletin attachment ${pIdx + 1}`}
+                              loading="lazy"
+                              className="h-32 sm:h-40 w-full object-cover group-hover:scale-105 transition-transform"
+                            />
+                            <span className="absolute bottom-1 right-1 bg-black/80 px-1 py-0.5 text-[8px] font-bold text-[#33FF00]">
+                              [ZOOM {pIdx + 1}/{msg.photos!.length}]
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </article>
-                );
-              })
-            )}
-          </div>
-        </>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </div>
       )}
 
-      {/* Fullscreen Photo Lightbox */}
-      {lightboxUrl && (
+      {lightboxPhoto && (
         <div
-          onClick={() => setLightboxUrl(null)}
+          onClick={() => setLightboxPhoto(null)}
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4"
         >
-          <div className="relative max-h-full max-w-2xl border-2 border-[#EAE6DF] bg-[#0D0D0D] p-2">
+          <div className="max-w-lg w-full border-2 border-[#33FF00] bg-[#0D0D0D] p-2 space-y-2">
+            <div className="flex items-center justify-between text-[10px] font-bold uppercase text-[#33FF00]">
+              <span>// ZINE PHOTO INSPECTION</span>
+              <button
+                type="button"
+                onClick={() => setLightboxPhoto(null)}
+                className="border border-[#D9381E] px-2 py-0.5 text-[#D9381E]"
+              >
+                [CLOSE X]
+              </button>
+            </div>
             <img
-              src={lightboxUrl}
-              alt="Enlarged attachment"
-              className="max-h-[80vh] w-auto object-contain"
+              src={lightboxPhoto}
+              alt="Full size zine attachment"
+              className="max-h-[75vh] w-full object-contain bg-black"
             />
-            <button
-              type="button"
-              onClick={() => setLightboxUrl(null)}
-              className="mt-2 w-full border border-[#EAE6DF] bg-[#D9381E] py-1.5 text-xs font-bold uppercase text-[#EAE6DF]"
+          </div>
+        </div>
+      )}
+
+      {/* MODE 2: PRIVATE SMALL CHAT ROOMS (PIRATE FREQUENCIES) */}
+      {viewMode === 'PRIVATE' && (
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+            {/* Create Small Private Room */}
+            <form
+              onSubmit={handleCreatePrivateRoom}
+              className="border border-[#33FF00]/60 bg-[#141414] p-3 space-y-2"
             >
-              [X] CLOSE IMAGE
-            </button>
+              <div className="text-[10px] font-bold uppercase text-[#33FF00]">
+                // SPIN UP PRIVATE FREQUENCY
+              </div>
+              <input
+                type="text"
+                value={newRoomName}
+                onChange={(e) => setNewRoomName(e.target.value)}
+                placeholder="ROOM NAME (E.G. BAND REHEARSAL)"
+                className="w-full border border-[#EAE6DF]/50 bg-black p-2 text-xs text-[#EAE6DF]"
+              />
+              <button
+                type="submit"
+                className="w-full border border-[#EAE6DF] bg-[#33FF00] p-1.5 text-[10px] font-bold uppercase text-[#0D0D0D]"
+              >
+                + GENERATE INVITE ROOM
+              </button>
+            </form>
+
+            {/* Join Existing Code */}
+            <form
+              onSubmit={handleJoinPrivateRoom}
+              className="border border-[#EAE6DF]/40 bg-[#141414] p-3 space-y-2"
+            >
+              <div className="text-[10px] font-bold uppercase text-[#EAE6DF]">
+                // TUNE INTO INVITE CODE
+              </div>
+              <input
+                type="text"
+                value={joinCodeInput}
+                onChange={(e) => setJoinCodeInput(e.target.value)}
+                placeholder="ENTER CODE (E.G. BUNKER77)"
+                className="w-full border border-[#EAE6DF]/50 bg-black p-2 text-xs uppercase text-[#EAE6DF]"
+              />
+              <button
+                type="submit"
+                className="w-full border border-[#33FF00] bg-black p-1.5 text-[10px] font-bold uppercase text-[#33FF00]"
+              >
+                TUNE FREQUENCY
+              </button>
+            </form>
+          </div>
+
+          {/* Room Selector Pills */}
+          <div className="flex flex-wrap items-center gap-1.5">
+            {privateRooms.map((room) => (
+              <button
+                key={room.code}
+                type="button"
+                onClick={() => setActivePrivateCode(room.code)}
+                className={`px-2.5 py-1 text-[10px] font-bold uppercase border ${
+                  activePrivateCode === room.code
+                    ? 'border-[#33FF00] bg-[#33FF00] text-[#0D0D0D]'
+                    : 'border-[#EAE6DF]/35 bg-[#141414] text-[#EAE6DF]'
+                }`}
+              >
+                🔒 {room.code}
+              </button>
+            ))}
+          </div>
+
+          {/* Active Small Chat Window */}
+          <div className="border-2 border-[#33FF00] bg-[#141414] p-3.5 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#EAE6DF]/30 pb-2">
+              <div>
+                <div className="text-xs font-bold uppercase text-[#33FF00]">
+                  🔒 {privateRooms.find((r) => r.code === activePrivateCode)?.name || activePrivateCode}
+                </div>
+                <div className="text-[10px] text-[#EAE6DF]/70">
+                  INVITE CODE: <span className="font-bold text-[#EAE6DF]">{activePrivateCode}</span>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  navigator.clipboard?.writeText(activePrivateCode);
+                  setCopiedCode(true);
+                  setTimeout(() => setCopiedCode(false), 2000);
+                }}
+                className="border border-[#33FF00] bg-black px-2 py-1 text-[10px] font-bold text-[#33FF00]"
+              >
+                {copiedCode ? '✓ COPIED' : '[COPY CODE]'}
+              </button>
+            </div>
+
+            <div className="max-h-64 overflow-y-auto space-y-2 bg-black p-2.5 border border-[#EAE6DF]/25">
+              {privateRoomMessages.length === 0 ? (
+                <div className="text-[11px] text-[#EAE6DF]/60">
+                  No transmissions on {activePrivateCode} yet. Share the invite code with your crew.
+                </div>
+              ) : (
+                privateRoomMessages.map((m) => {
+                  const isBandMsg =
+                    m.sender_role === 'BAND' ||
+                    m.sender_role === 'ARTIST' ||
+                    isKnownBandHandle(m.sender_handle);
+                  const isAdminMsg = m.sender_role === 'ADMIN';
+                  return (
+                  <div
+                    key={m.id}
+                    className={`text-xs border-b pb-1.5 px-2 py-1 ${
+                      isAdminMsg
+                        ? 'border-[#33FF00]/40 bg-[#33FF00]/10 border-l-2 border-l-[#33FF00]'
+                        : isBandMsg
+                        ? 'border-[#D9381E]/40 bg-[#D9381E]/10 border-l-2 border-l-[#D9381E]'
+                        : 'border-[#EAE6DF]/15'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <span
+                        className={`font-bold ${
+                          isAdminMsg
+                            ? 'text-[#33FF00]'
+                            : isBandMsg
+                            ? 'text-[#FF6B52]'
+                            : 'text-[#EAE6DF]'
+                        }`}
+                      >
+                        @{m.sender_handle}
+                      </span>
+                      <span
+                        className={`px-1 py-0.2 text-[8px] font-bold uppercase ${
+                          isAdminMsg
+                            ? 'bg-[#33FF00] text-[#0D0D0D]'
+                            : isBandMsg
+                            ? 'bg-[#D9381E] text-[#EAE6DF]'
+                            : 'text-[#EAE6DF]/50'
+                        }`}
+                      >
+                        {isAdminMsg ? '⚡ ADMIN' : isBandMsg ? '★ BAND' : `[${m.sender_role}]`}
+                      </span>
+                    </div>
+                    <div className="text-[#EAE6DF]/95 mt-0.5">{m.content}</div>
+                  </div>
+                  );
+                })
+              )}
+            </div>
+
+            <form onSubmit={handleSendPrivateMessage} className="flex gap-2">
+              <input
+                type="text"
+                value={privateDraft}
+                onChange={(e) => setPrivateDraft(e.target.value)}
+                placeholder={`Message ${activePrivateCode}...`}
+                className="flex-1 border border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
+              />
+              <button
+                type="submit"
+                className="border-2 border-[#EAE6DF] bg-[#33FF00] px-3 py-2 text-xs font-bold uppercase text-[#0D0D0D]"
+              >
+                SEND
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODE 3: TIMIȘOARA UNDERGROUND MAP & GIG CALENDAR */}
+      {viewMode === 'RADAR' && (
+        <div className="space-y-4">
+          <GigRadarMap
+            venues={TIMISOARA_REAL_VENUES}
+            gigs={UPCOMING_CALENDAR_GIGS}
+            selectedVenueId={selectedVenueFilter}
+            onSelectVenue={(venueId) =>
+              setSelectedVenueFilter((prev) => (prev === venueId ? 'ALL' : venueId))
+            }
+          />
+
+          <div className="border-2 border-[#EAE6DF] bg-[#141414] p-3.5 space-y-2.5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold uppercase text-[#33FF00]">
+                // TIMIȘOARA LIVE GIG CALENDAR ({visibleCalendarGigs.length})
+              </span>
+              {selectedVenueFilter !== 'ALL' && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedVenueFilter('ALL')}
+                  className="text-[10px] underline text-[#D9381E]"
+                >
+                  [RESET FILTER]
+                </button>
+              )}
+            </div>
+
+            <div className="flex flex-wrap gap-1">
+              <button
+                type="button"
+                onClick={() => setSelectedVenueFilter('ALL')}
+                className={`px-2 py-0.5 text-[9px] font-bold border ${
+                  selectedVenueFilter === 'ALL'
+                    ? 'border-[#33FF00] bg-[#33FF00] text-[#0D0D0D]'
+                    : 'border-[#EAE6DF]/30 bg-black text-[#EAE6DF]'
+                }`}
+              >
+                ALL VENUES
+              </button>
+              {TIMISOARA_REAL_VENUES.map((v) => (
+                <button
+                  key={v.name}
+                  type="button"
+                  onClick={() => setSelectedVenueFilter(v.id)}
+                  className={`px-2 py-0.5 text-[9px] font-bold border ${
+                    selectedVenueFilter === v.id
+                      ? 'border-[#33FF00] bg-[#33FF00] text-[#0D0D0D]'
+                      : 'border-[#EAE6DF]/30 bg-black text-[#EAE6DF]'
+                  }`}
+                >
+                  {v.name}
+                </button>
+              ))}
+            </div>
+
+            <div className="space-y-2">
+              {visibleCalendarGigs.map((gig) => (
+                <div
+                  key={gig.id}
+                  className="border border-[#EAE6DF]/35 bg-black p-2.5 text-xs space-y-1"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="bg-[#D9381E] px-1.5 py-0.5 text-[9px] font-bold uppercase text-[#EAE6DF]">
+                      {gig.dateLabel}
+                    </span>
+                    <span className="text-[10px] font-bold text-[#33FF00]">{gig.genre}</span>
+                  </div>
+                  <div className="font-bold text-[#EAE6DF]">{gig.title}</div>
+                  <div className="text-[11px] text-[#EAE6DF]/75">
+                    📍 {gig.venueName} • {gig.band}
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       )}

@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import type { AccountType } from "../types";
 import {
   loginOperative,
   registerOperative,
@@ -9,7 +10,6 @@ interface GatekeeperProps {
   onAuthenticated: (profile: ProfileRecord) => void;
 }
 
-// Timișoara Genesis Coordinates (Casa de Cultură a Studenților / Central Zone)
 const TIMISOARA_LAT = 45.7489;
 const TIMISOARA_LON = 21.2087;
 const MAX_DISTANCE_KM = 15;
@@ -28,6 +28,7 @@ function calculateDistanceKm(lat1: number, lon1: number, lat2: number, lon2: num
 
 export const Gatekeeper: React.FC<GatekeeperProps> = ({ onAuthenticated }) => {
   const [authMode, setAuthMode] = useState<"LOGIN" | "REGISTER">("LOGIN");
+  const [accountType, setAccountType] = useState<AccountType>("OPERATIVE");
   const [handleInput, setHandleInput] = useState("");
   const [passwordInput, setPasswordInput] = useState("");
   const [passphrase, setPassphrase] = useState("");
@@ -39,7 +40,7 @@ export const Gatekeeper: React.FC<GatekeeperProps> = ({ onAuthenticated }) => {
     const cleanHandle = handleInput.trim().replace(/^@+/, "");
     if (cleanHandle.length < 3) {
       setStatusType("error");
-      setStatusMessage("OPERATIVE HANDLE REQUIRED (MIN 3 CHARS)");
+      setStatusMessage("HANDLE REQUIRED (MIN 3 CHARS)");
       return null;
     }
     if (passwordInput.length < 6) {
@@ -56,16 +57,22 @@ export const Gatekeeper: React.FC<GatekeeperProps> = ({ onAuthenticated }) => {
 
     setIsBusy(true);
     setStatusType("info");
-    setStatusMessage(`MINTING OPERATIVE CREDENTIALS (${sourceLabel})...`);
+    setStatusMessage(`MINTING ${accountType} CREDENTIALS (${sourceLabel})...`);
 
     try {
-      const profile = await registerOperative(creds.handle, creds.password);
+      const profile = await registerOperative(creds.handle, creds.password, accountType);
       setStatusType("success");
-      setStatusMessage(`ACCOUNT CREATED // WELCOME @${profile.handle.toUpperCase()}`);
+      setStatusMessage(
+        `${accountType} ACCOUNT CREATED // WELCOME @${profile.handle.toUpperCase()}`
+      );
       setTimeout(() => onAuthenticated(profile), 450);
     } catch (err) {
       setStatusType("error");
-      setStatusMessage(err && typeof err === "object" && "message" in err ? String((err as { message: string }).message).toUpperCase() : "REGISTRATION FAILED");
+      setStatusMessage(
+        err && typeof err === "object" && "message" in err
+          ? String((err as { message: string }).message).toUpperCase()
+          : "REGISTRATION FAILED"
+      );
     } finally {
       setIsBusy(false);
     }
@@ -210,11 +217,53 @@ export const Gatekeeper: React.FC<GatekeeperProps> = ({ onAuthenticated }) => {
           </div>
         )}
 
+        {/* Account Clearance Type (Registration Only) */}
+        {authMode === "REGISTER" && (
+          <div className="space-y-1.5">
+            <label className="block text-xs font-bold uppercase">
+              00 // ACCOUNT CLEARANCE TYPE:
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setAccountType("OPERATIVE")}
+                className={`border-2 p-2.5 text-left transition-colors rounded-none ${
+                  accountType === "OPERATIVE"
+                    ? "border-[#33FF00] bg-[#33FF00]/15 text-[#33FF00]"
+                    : "border-[#EAE6DF]/40 bg-[#0D0D0D] text-[#EAE6DF]/70 hover:border-[#EAE6DF]"
+                }`}
+              >
+                <div className="text-xs font-bold uppercase">[LISTENER / OPERATIVE]</div>
+                <div className="text-[10px] opacity-80 mt-0.5">
+                  Scan nodes, earn PTS, redeem vouchers
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setAccountType("BAND")}
+                className={`border-2 p-2.5 text-left transition-colors rounded-none ${
+                  accountType === "BAND"
+                    ? "border-[#D9381E] bg-[#D9381E]/20 text-[#EAE6DF]"
+                    : "border-[#EAE6DF]/40 bg-[#0D0D0D] text-[#EAE6DF]/70 hover:border-[#EAE6DF]"
+                }`}
+              >
+                <div className="text-xs font-bold uppercase text-[#D9381E]">
+                  [BAND / COLLECTIVE]
+                </div>
+                <div className="text-[10px] opacity-80 mt-0.5">
+                  Mint gig tickets, merch &amp; market drops
+                </div>
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Shared Credentials Inputs */}
         <div className="space-y-3">
           <div className="space-y-1">
             <label htmlFor="operative-handle" className="block text-xs font-bold uppercase">
-              01 // OPERATIVE HANDLE:
+              01 // {authMode === "REGISTER" && accountType === "BAND" ? "BAND / COLLECTIVE HANDLE:" : "OPERATIVE HANDLE:"}
             </label>
             <input
               id="operative-handle"
@@ -224,7 +273,7 @@ export const Gatekeeper: React.FC<GatekeeperProps> = ({ onAuthenticated }) => {
                 setHandleInput(e.target.value);
                 if (statusType === "error") setStatusMessage(null);
               }}
-              placeholder="andrei77"
+              placeholder={authMode === "REGISTER" && accountType === "BAND" ? "zgomot_subteran" : "andrei77"}
               autoComplete="username"
               className="w-full bg-[#0D0D0D] border-2 border-[#EAE6DF] px-3 py-2.5 text-sm text-[#33FF00] placeholder-[#EAE6DF]/35 focus:outline-none focus:border-[#33FF00] rounded-none"
             />
@@ -261,7 +310,6 @@ export const Gatekeeper: React.FC<GatekeeperProps> = ({ onAuthenticated }) => {
             </button>
           </form>
         ) : (
-          /* REGISTER VIEW (Requires Genesis Location or Scene Passphrase) */
           <div className="space-y-4 border-t-2 border-[#EAE6DF]/20 pt-4">
             <div className="space-y-2">
               <div className="flex items-center justify-between text-xs font-bold uppercase">
@@ -315,7 +363,7 @@ export const Gatekeeper: React.FC<GatekeeperProps> = ({ onAuthenticated }) => {
                 disabled={isBusy}
                 className="w-full bg-[#D9381E] text-[#EAE6DF] border-2 border-[#EAE6DF] py-2.5 text-xs sm:text-sm font-bold uppercase hover:bg-[#EAE6DF] hover:text-[#0D0D0D] disabled:opacity-50 transition-colors rounded-none"
               >
-                {isBusy ? "[REGISTERING...]" : "[CREATE ACCOUNT & ENTER]"}
+                {isBusy ? "[REGISTERING...]" : `[CREATE ${accountType} ACCOUNT]`}
               </button>
             </form>
           </div>

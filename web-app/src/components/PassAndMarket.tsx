@@ -1,13 +1,28 @@
 import React, { useEffect, useState } from 'react';
 import { Landmark, UserState } from '../types';
 import { burnOperativeAccount } from '../utils/supabaseClient';
+import {
+  getCustomDuties,
+  getCustomLandmarks,
+  getCustomMarketItems,
+  isKnownBandHandle,
+  saveCustomDuties,
+  saveCustomLandmarks,
+  saveCustomMarketItems,
+} from '../utils/supabaseClient';
+import { computeFastDHash } from '../utils/scannerHash';
+import { CommunityDuty, Landmark, MarketItem as SharedMarketItem } from '../types';
+
 
 interface PassAndMarketProps {
   mode: 'PASS' | 'MARKET';
   state: UserState;
   landmarks: Landmark[];
+  hasMarketClearance?: boolean;
+  hasMarketDiscount?: boolean;
   onSpendPoints: (cost: number) => boolean;
   onAccountBurned?: () => void;
+  onContentUpdated?: () => void;
 }
 
 type RewardCategory = 'GIG TICKET' | 'MERCH VOUCHER' | 'BACKSTAGE PASS' | 'CUSTOM TOKEN';
@@ -94,9 +109,14 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
   mode,
   state,
   landmarks,
+  hasMarketClearance = false,
+  hasMarketDiscount = false,
   onSpendPoints,
   onAccountBurned,
+  onContentUpdated,
 }) => {
+  const isBandAccount = ['BAND', 'ARTIST', 'ADMIN'].includes(String(state.accountType || '').toUpperCase()) || isKnownBandHandle(state.handle || '');
+
   const [copied, setCopied] = useState(false);
   const [marketNotice, setMarketNotice] = useState<string | null>(null);
   const [confirmBurn, setConfirmBurn] = useState(false);
@@ -121,8 +141,8 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
     }
   });
 
-  const [showBandPortal, setShowBandPortal] = useState(false);
-  const [bandName, setBandName] = useState('');
+  const [showBandPortal, setShowBandPortal] = useState(true);
+  const [bandName, setBandName] = useState(() => state.handle.toUpperCase());
   const [category, setCategory] = useState<RewardCategory>('GIG TICKET');
   const [rewardTitle, setRewardTitle] = useState('');
   const [rewardCost, setRewardCost] = useState(150);
@@ -156,7 +176,7 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
     setBurnError(null);
     try {
       await burnOperativeAccount(state.handle);
-      localStorage.removeItem('frecventa77_user_state_v1');
+      localStorage.removeItem('frecventa77_state');
       localStorage.removeItem(VOUCHERS_KEY);
       if (onAccountBurned) {
         onAccountBurned();
@@ -169,12 +189,20 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
     }
   };
 
+  const getEffectiveCost = (baseCost: number) =>
+    hasMarketDiscount ? Math.round(baseCost * 0.8) : baseCost;
+
   const handleRedeem = (item: MarketItem) => {
+    if (!hasMarketClearance) {
+      setMarketNotice('CLEARANCE LOCKED // DECRYPT NODE 02 IN [TRACK] QUIZ TREE TO REDEEM DROPS');
+      return;
+    }
     if (!item.approved) {
       setMarketNotice('PENDING CURATOR APPROVAL // APPROVE BAND DROP FIRST');
       return;
     }
-    const success = onSpendPoints(item.cost);
+    const finalCost = getEffectiveCost(item.cost);
+    const success = onSpendPoints(finalCost);
     if (!success) {
       setMarketNotice(`INSUFFICIENT SIGNAL // NEED ${item.cost} PTS FOR ${item.title}`);
       return;
@@ -202,6 +230,7 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
 
   const handleCreateBandDrop = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isBandAccount) return;
     if (!bandName.trim() || !rewardTitle.trim()) return;
 
     const prefixMap: Record<RewardCategory, string> = {
@@ -225,10 +254,22 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
     };
 
     setCustomItems((prev) => [newDrop, ...prev]);
-    setBandName('');
     setRewardTitle('');
     setRewardDesc('');
     setShowBandPortal(false);
+    const sharedDrop: SharedMarketItem = {
+      id: newDrop.id,
+      title: newDrop.title,
+      vendor: newDrop.bandName,
+      category: 'GIG ACCESS',
+      createdByType: 'BAND',
+      cost: newDrop.cost,
+      description: newDrop.description,
+      stock: 25,
+      codePrefix: newDrop.prefix,
+    };
+    saveCustomMarketItems([sharedDrop, ...getCustomMarketItems()]);
+    onContentUpdated?.();
     setMarketNotice(
       instantVerify
         ? `BAND TOKEN LIVE // ${newDrop.bandName} DROP PUBLISHED TO MARKET`
@@ -236,7 +277,103 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
     );
   };
 
+
+  const [bandStudioTab, setBandStudioTab] = useState<'TOKEN' | 'NODE' | 'VOLUNTEER'>('TOKEN');
+  const [bandNodeTitle, setBandNodeTitle] = useState('');
+  const [bandNodeLocation, setBandNodeLocation] = useState('Manufactura / Timișoara');
+  const [bandNodeRiddle, setBandNodeRiddle] = useState('');
+  const [bandNodeStory, setBandNodeStory] = useState('');
+  const [bandNodePoints, setBandNodePoints] = useState('150');
+  const [bandNodePhoto, setBandNodePhoto] = useState('');
+  const [bandNodeHash, setBandNodeHash] = useState('');
+
+  const [bandDutyTitle, setBandDutyTitle] = useState('');
+  const [bandDutyVenue, setBandDutyVenue] = useState('Manufactura');
+  const [bandDutyType, setBandDutyType] = useState<CommunityDuty['dutyType']>('ROADIE SHIFT');
+  const [bandDutyPoints, setBandDutyPoints] = useState('130');
+  const [bandDutyPerk, setBandDutyPerk] = useState('FREE ENTRY + SOUNDCHECK + 1X DRINK TOKEN');
+  const [bandDutyCode, setBandDutyCode] = useState('AMP77');
+  const [bandDutyHint, setBandDutyHint] = useState('Stage door 60 mins before doors');
+
+  const handleBandNodePhoto = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const hash = await computeFastDHash(file);
+    setBandNodeHash(hash);
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      const scale = Math.min(1, 320 / Math.max(img.width, img.height));
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        setBandNodePhoto(canvas.toDataURL('image/jpeg', 0.65));
+      }
+      URL.revokeObjectURL(url);
+    };
+    img.src = url;
+  };
+
+  const handleMintBandNode = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!isBandAccount || !bandNodeTitle.trim()) return;
+    const newNode: Landmark = {
+      id: `band-node-${Date.now()}`,
+      title: bandNodeTitle.trim(),
+      band: (state.handle || 'LOCAL BAND').toUpperCase(),
+      era: '2026 // LIVE DROP',
+      locationName: bandNodeLocation.trim() || 'Timișoara Underground',
+      lat: 45.7537,
+      lng: 21.2257,
+      radiusMeters: 60,
+      points: Number(bandNodePoints) || 150,
+      difficulty: 'FIELD',
+      trackOrder: landmarks.length + getCustomLandmarks().length + 1,
+      createdByType: 'BAND',
+      creatorHandle: state.handle,
+      riddle: bandNodeRiddle.trim() || `Find @${state.handle}'s street sticker or poster drop.`,
+      story: bandNodeStory.trim() || `Official field recon node minted by @${state.handle}.`,
+      referenceImageUrl:
+        bandNodePhoto ||
+        'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=420&q=65',
+      referenceDHash: bandNodeHash || '0'.repeat(64),
+    };
+    saveCustomLandmarks([newNode, ...getCustomLandmarks()]);
+    onContentUpdated?.();
+    setMarketNotice(`BAND NODE LIVE // "${newNode.title.toUpperCase()}" DEPLOYED TO [SCAN] RADAR`);
+    setBandNodeTitle('');
+    setBandNodeRiddle('');
+    setBandNodeStory('');
+    setBandNodePhoto('');
+    setBandNodeHash('');
+  };
+
+  const handleMintBandDuty = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!isBandAccount || !bandDutyTitle.trim()) return;
+    const newDuty: CommunityDuty = {
+      id: `band-duty-${Date.now()}`,
+      title: bandDutyTitle.trim().toUpperCase(),
+      bandOrVenue: `${(state.handle || 'BAND').toUpperCase()} @ ${bandDutyVenue.trim() || 'TIMIȘOARA'}`,
+      dutyType: bandDutyType,
+      points: Number(bandDutyPoints) || 130,
+      instantReward: bandDutyPerk.trim() || 'GUESTLIST + BACKSTAGE HANG',
+      repeatable: true,
+      locationHint: bandDutyHint.trim() || 'Venue front desk / stage left',
+      verificationCode: (bandDutyCode.trim() || 'AMP77').toUpperCase(),
+      description: `Live gig volunteer shift posted by @${state.handle}.`,
+    };
+    saveCustomDuties([newDuty, ...getCustomDuties()]);
+    onContentUpdated?.();
+    setMarketNotice(`GIG VOLUNTEER SHIFT LIVE // "${newDuty.title}" PUBLISHED TO [TRACK -> 02. ROADIE]`);
+    setBandDutyTitle('');
+  };
+
   const toggleApproveItem = (id: string) => {
+    if (!isBandAccount) return;
     setCustomItems((prev) =>
       prev.map((item) => (item.id === id ? { ...item, approved: !item.approved } : item))
     );
@@ -245,7 +382,6 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
   if (mode === 'PASS') {
     return (
       <div className="space-y-5">
-        {/* 1970s Underground Union Card / Bootleg Cassette J-Card */}
         <section className="xerox-paper border-2 border-[#EAE6DF] text-[#0D0D0D] p-0 rounded-none">
           <div className="bg-[#0D0D0D] text-[#EAE6DF] px-4 py-2.5 border-b-2 border-[#0D0D0D] flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -255,6 +391,7 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
               </span>
             </div>
             <span className="text-[11px] font-bold bg-[#EAE6DF] text-[#0D0D0D] px-1.5 py-0.5 uppercase">
+              {isBandAccount ? 'BAND // ' : ''}
               {rank.tier}
             </span>
           </div>
@@ -262,8 +399,17 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
           <div className="p-4 space-y-4">
             <div className="border-2 border-[#0D0D0D] divide-y-2 divide-[#0D0D0D]">
               <div className="p-2.5 flex justify-between items-center bg-[#EAE6DF]">
-                <span className="text-[11px] font-bold uppercase opacity-75">OPERATIVE HANDLE</span>
-                <span className="text-sm font-bold uppercase">{state.handle}</span>
+                <span className="text-[11px] font-bold uppercase opacity-75">
+                  {isBandAccount ? 'BAND / COLLECTIVE' : 'OPERATIVE HANDLE'}
+                </span>
+                <div className="flex items-center gap-2">
+                  {isBandAccount && (
+                    <span className="bg-[#D9381E] text-[#EAE6DF] text-[10px] font-bold px-1.5 py-0.5 uppercase">
+                      VERIFIED BAND
+                    </span>
+                  )}
+                  <span className="text-sm font-bold uppercase">{state.handle}</span>
+                </div>
               </div>
               <div className="p-2.5 flex justify-between items-center bg-[#EAE6DF]">
                 <span className="text-[11px] font-bold uppercase opacity-75">SIGNAL CREDITS</span>
@@ -279,7 +425,6 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
               </div>
             </div>
 
-            {/* 2x2 Ink-Stamp Grid */}
             <div className="space-y-2">
               <div className="flex items-center justify-between border-b-2 border-[#0D0D0D] pb-1">
                 <span className="text-xs font-bold uppercase tracking-wider">
@@ -338,7 +483,6 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
           </div>
         </section>
 
-        {/* Native Comms Secret Frequency Clearance (Unlocked at 150+ pts) */}
         {state.points >= 150 && (
           <section className="border-2 border-[#33FF00] bg-[#141414] p-4 space-y-3 rounded-none">
             <div className="flex items-center justify-between border-b-2 border-[#33FF00]/40 pb-2">
@@ -386,8 +530,8 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
           </div>
 
           <p className="text-[11px] text-[#EAE6DF]/80 leading-relaxed">
-            Wipes your operative dossier, password hash, and signal credits from the central
-            archive completely—leaving zero dead profiles behind and freeing{' '}
+            Wipes your dossier, password hash, and signal credits from the central archive
+            completely—leaving zero dead profiles behind and freeing{' '}
             <span className="font-bold text-[#EAE6DF]">@{state.handle.toUpperCase()}</span>.
           </p>
 
@@ -435,7 +579,7 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
     );
   }
 
-  // BLACK MARKET + BAND TOKEN CREATOR VIEW
+  // BLACK MARKET + BAND-ONLY TOKEN CREATOR VIEW
   return (
     <div className="space-y-5">
       <div className="border-2 border-[#EAE6DF] bg-[#141414] p-4 flex items-center justify-between">
@@ -453,120 +597,277 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
         </div>
       </div>
 
-      <div className="border-2 border-[#EAE6DF] bg-[#141414] p-3">
-        <button
-          type="button"
-          onClick={() => setShowBandPortal((prev) => !prev)}
-          className="w-full flex items-center justify-between text-left text-xs font-bold uppercase tracking-wider text-[#33FF00]"
-        >
-          <span>[+ BAND / ARTIST PORTAL] APPLY &amp; MINT CUSTOM REWARD</span>
-          <span>{showBandPortal ? '[-]' : '[+]'}</span>
-        </button>
+      {/* Band-Only Studio: Mint Market Tokens, Scan Nodes & Gig Volunteer Shifts */}
+      {isBandAccount ? (
+        <div className="border-2 border-[#33FF00] bg-[#141414] p-3">
+          <button
+            type="button"
+            onClick={() => setShowBandPortal((prev) => !prev)}
+            className="w-full flex items-center justify-between text-left text-xs font-bold uppercase tracking-wider text-[#33FF00]"
+          >
+            <span>[BAND / ARTIST STUDIO] MINT TOKENS, SCAN NODES &amp; GIG SHIFTS</span>
+            <span>{showBandPortal ? '[-]' : '[+]'}</span>
+          </button>
 
-        {showBandPortal && (
-          <form onSubmit={handleCreateBandDrop} className="mt-4 pt-3 border-t border-[#EAE6DF]/30 space-y-3">
-            <p className="text-[11px] text-[#EAE6DF]/80 leading-relaxed">
-              Local Timișoara bands &amp; DIY collectives can apply to mint custom gig tickets,
-              merch vouchers, or backstage tokens redeemable with listener points.
-            </p>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-              <div>
-                <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
-                  BAND / COLLECTIVE NAME *
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={bandName}
-                  onChange={(e) => setBandName(e.target.value)}
-                  placeholder="EX: ZGOMOT SUBTERAN"
-                  className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs uppercase text-[#EAE6DF]"
-                />
+          {showBandPortal && (
+            <div className="mt-3 pt-3 border-t border-[#EAE6DF]/30 space-y-3">
+              <div className="grid grid-cols-3 gap-1">
+                {(
+                  [
+                    ['TOKEN', '01. MARKET TOKEN'],
+                    ['NODE', '02. SCAN NODE'],
+                    ['VOLUNTEER', '03. GIG SHIFT'],
+                  ] as const
+                ).map(([tabKey, tabLabel]) => (
+                  <button
+                    key={tabKey}
+                    type="button"
+                    onClick={() => setBandStudioTab(tabKey)}
+                    className={`p-1.5 text-[10px] font-bold uppercase border ${
+                      bandStudioTab === tabKey
+                        ? 'border-[#33FF00] bg-[#33FF00] text-[#0D0D0D]'
+                        : 'border-[#EAE6DF]/35 bg-black text-[#EAE6DF]'
+                    }`}
+                  >
+                    {tabLabel}
+                  </button>
+                ))}
               </div>
 
-              <div>
-                <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
-                  TOKEN / REWARD TYPE
-                </label>
-                <select
-                  value={category}
-                  onChange={(e) => setCategory(e.target.value as RewardCategory)}
-                  className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs uppercase text-[#EAE6DF]"
-                >
-                  <option value="GIG TICKET">GIG TICKET</option>
-                  <option value="MERCH VOUCHER">MERCH VOUCHER</option>
-                  <option value="BACKSTAGE PASS">BACKSTAGE PASS</option>
-                  <option value="CUSTOM TOKEN">CUSTOM TOKEN</option>
-                </select>
-              </div>
+              {bandStudioTab === 'TOKEN' && (
+                <form onSubmit={handleCreateBandDrop} className="space-y-3">
+                  <p className="text-[11px] text-[#EAE6DF]/80 leading-relaxed">
+                    Verified Band Account active. Mint custom gig tickets, merch vouchers, or
+                    backstage tokens redeemable with listener signal points.
+                  </p>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    <div>
+                      <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
+                        BAND / COLLECTIVE NAME *
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        value={bandName}
+                        onChange={(e) => setBandName(e.target.value)}
+                        placeholder="EX: ZGOMOT SUBTERAN"
+                        className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs uppercase text-[#EAE6DF]"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
+                        TOKEN / REWARD TYPE
+                      </label>
+                      <select
+                        value={category}
+                        onChange={(e) => setCategory(e.target.value as RewardCategory)}
+                        className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs uppercase text-[#EAE6DF]"
+                      >
+                        <option value="GIG TICKET">GIG TICKET</option>
+                        <option value="MERCH VOUCHER">MERCH VOUCHER</option>
+                        <option value="BACKSTAGE PASS">BACKSTAGE PASS</option>
+                        <option value="CUSTOM TOKEN">CUSTOM TOKEN</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                    <div className="sm:col-span-2">
+                      <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
+                        REWARD TITLE *
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        value={rewardTitle}
+                        onChange={(e) => setRewardTitle(e.target.value)}
+                        placeholder="EX: FREE ENTRY + CASSETTE DEMO"
+                        className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs uppercase text-[#EAE6DF]"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
+                        POINT COST
+                      </label>
+                      <input
+                        type="number"
+                        min={50}
+                        max={2000}
+                        step={50}
+                        value={rewardCost}
+                        onChange={(e) => setRewardCost(Number(e.target.value))}
+                        className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
+                      REDEMPTION DETAILS / VENUE
+                    </label>
+                    <input
+                      type="text"
+                      value={rewardDesc}
+                      onChange={(e) => setRewardDesc(e.target.value)}
+                      placeholder="Show voucher code at the door before 22:00."
+                      className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
+                    />
+                  </div>
+
+                  <label className="flex items-center justify-between border border-dashed border-[#EAE6DF]/40 bg-black p-2 text-[11px] cursor-pointer">
+                    <span className="uppercase text-[#EAE6DF]/80">
+                      [CURATOR MODE] Auto-Approve Band Drop
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={instantVerify}
+                      onChange={(e) => setInstantVerify(e.target.checked)}
+                      className="h-4 w-4 accent-[#33FF00]"
+                    />
+                  </label>
+
+                  <button
+                    type="submit"
+                    className="w-full rounded-none border-2 border-[#EAE6DF] bg-[#33FF00] p-2.5 text-xs font-bold uppercase tracking-wider text-[#0D0D0D]"
+                  >
+                    MINT &amp; PUBLISH BAND REWARD
+                  </button>
+                </form>
+              )}
+
+              {bandStudioTab === 'NODE' && (
+                <form onSubmit={handleMintBandNode} className="space-y-2.5">
+                  <p className="text-[11px] text-[#EAE6DF]/80">
+                    Deploy a street poster, venue stamp, or hidden merch drop directly to the live [SCAN] radar.
+                  </p>
+                  <input
+                    type="text"
+                    required
+                    placeholder="NODE TITLE (E.G. ZGOMOT SUBTERAN POSTER DROP)"
+                    value={bandNodeTitle}
+                    onChange={(e) => setBandNodeTitle(e.target.value)}
+                    className="w-full border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
+                  />
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <input
+                      type="text"
+                      placeholder="VENUE / STREET LOCATION"
+                      value={bandNodeLocation}
+                      onChange={(e) => setBandNodeLocation(e.target.value)}
+                      className="border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
+                    />
+                    <input
+                      type="number"
+                      placeholder="SIGNAL PTS (150)"
+                      value={bandNodePoints}
+                      onChange={(e) => setBandNodePoints(e.target.value)}
+                      className="border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
+                    />
+                  </div>
+                  <input
+                    type="text"
+                    placeholder="RIDDLE / CLUE FOR FANS"
+                    value={bandNodeRiddle}
+                    onChange={(e) => setBandNodeRiddle(e.target.value)}
+                    className="w-full border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
+                  />
+                  <div className="flex items-center justify-between gap-2 border border-[#EAE6DF]/40 bg-black p-2 text-[10px]">
+                    <span className="text-[#33FF00]">
+                      {bandNodePhoto ? '✓ TARGET PHOTO + DHASH LOCKED' : 'UPLOAD TARGET PHOTO:'}
+                    </span>
+                    <input type="file" accept="image/*" onChange={handleBandNodePhoto} />
+                  </div>
+                  <button
+                    type="submit"
+                    className="w-full border-2 border-[#EAE6DF] bg-[#33FF00] p-2.5 text-xs font-bold uppercase text-[#0D0D0D]"
+                  >
+                    MINT &amp; DEPLOY BAND SCAN NODE
+                  </button>
+                </form>
+              )}
+
+              {bandStudioTab === 'VOLUNTEER' && (
+                <form onSubmit={handleMintBandDuty} className="space-y-2.5">
+                  <p className="text-[11px] text-[#EAE6DF]/80">
+                    Post a roadie, merch desk, or soundcheck shift. Fans enter your secret code at the gig to claim points &amp; perks.
+                  </p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <input
+                      type="text"
+                      required
+                      placeholder="SHIFT TITLE (E.G. AMP LOAD-IN)"
+                      value={bandDutyTitle}
+                      onChange={(e) => setBandDutyTitle(e.target.value)}
+                      className="border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
+                    />
+                    <input
+                      type="text"
+                      required
+                      placeholder="VENUE (E.G. MANUFACTURA)"
+                      value={bandDutyVenue}
+                      onChange={(e) => setBandDutyVenue(e.target.value)}
+                      className="border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
+                    />
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <select
+                      value={bandDutyType}
+                      onChange={(e) => setBandDutyType(e.target.value as CommunityDuty['dutyType'])}
+                      className="border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
+                    >
+                      <option value="ROADIE SHIFT">ROADIE SHIFT</option>
+                      <option value="POSTER RUN">POSTER RUN</option>
+                      <option value="MERCH DESK">MERCH DESK</option>
+                      <option value="SOUNDCHECK HELP">SOUNDCHECK HELP</option>
+                    </select>
+                    <input
+                      type="number"
+                      placeholder="POINTS (130)"
+                      value={bandDutyPoints}
+                      onChange={(e) => setBandDutyPoints(e.target.value)}
+                      className="border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
+                    />
+                    <input
+                      type="text"
+                      placeholder="SECRET CODE"
+                      value={bandDutyCode}
+                      onChange={(e) => setBandDutyCode(e.target.value)}
+                      className="border-2 border-[#EAE6DF] bg-black p-2 text-xs uppercase text-[#33FF00]"
+                    />
+                  </div>
+                  <input
+                    type="text"
+                    placeholder="INSTANT REAL-WORLD PERK (E.G. GUESTLIST + DRINK TOKEN)"
+                    value={bandDutyPerk}
+                    onChange={(e) => setBandDutyPerk(e.target.value)}
+                    className="w-full border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
+                  />
+                  <input
+                    type="text"
+                    placeholder="MEETING POINT & TIME"
+                    value={bandDutyHint}
+                    onChange={(e) => setBandDutyHint(e.target.value)}
+                    className="w-full border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
+                  />
+                  <button
+                    type="submit"
+                    className="w-full border-2 border-[#EAE6DF] bg-[#33FF00] p-2.5 text-xs font-bold uppercase text-[#0D0D0D]"
+                  >
+                    MINT &amp; PUBLISH GIG VOLUNTEER JOB
+                  </button>
+                </form>
+              )}
             </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-              <div className="sm:col-span-2">
-                <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
-                  REWARD TITLE *
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={rewardTitle}
-                  onChange={(e) => setRewardTitle(e.target.value)}
-                  placeholder="EX: FREE ENTRY + CASSETTE DEMO"
-                  className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs uppercase text-[#EAE6DF]"
-                />
-              </div>
-
-              <div>
-                <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
-                  POINT COST
-                </label>
-                <input
-                  type="number"
-                  min={50}
-                  max={2000}
-                  step={50}
-                  value={rewardCost}
-                  onChange={(e) => setRewardCost(Number(e.target.value))}
-                  className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
-                />
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
-                REDEMPTION DETAILS / VENUE
-              </label>
-              <input
-                type="text"
-                value={rewardDesc}
-                onChange={(e) => setRewardDesc(e.target.value)}
-                placeholder="Show voucher code at the door before 22:00."
-                className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
-              />
-            </div>
-
-            <label className="flex items-center justify-between border border-dashed border-[#EAE6DF]/40 bg-black p-2 text-[11px] cursor-pointer">
-              <span className="uppercase text-[#EAE6DF]/80">
-                [CURATOR MODE] Auto-Approve Band Application
-              </span>
-              <input
-                type="checkbox"
-                checked={instantVerify}
-                onChange={(e) => setInstantVerify(e.target.checked)}
-                className="h-4 w-4 accent-[#33FF00]"
-              />
-            </label>
-
-            <button
-              type="submit"
-              className="w-full rounded-none border-2 border-[#EAE6DF] bg-[#33FF00] p-2.5 text-xs font-bold uppercase tracking-wider text-[#0D0D0D]"
-            >
-              MINT &amp; PUBLISH BAND REWARD
-            </button>
-          </form>
-        )}
-      </div>
+          )}
+        </div>
+      ) : (
+        <div className="border border-dashed border-[#EAE6DF]/35 bg-[#141414]/60 px-3 py-2.5 text-[11px] text-[#EAE6DF]/65 uppercase">
+          [BAND MINTING LOCKED] // ONLY REGISTERED <span className="text-[#D9381E] font-bold">BAND / COLLECTIVE</span> ACCOUNTS CAN ISSUE MARKET TOKENS &amp; VOUCHERS.
+        </div>
+      )}
 
       {marketNotice && (
         <div className="border-2 border-[#D9381E] bg-[#D9381E]/15 p-3 text-xs font-bold text-[#D9381E] uppercase">
@@ -575,8 +876,21 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
       )}
 
       <div className="space-y-3">
+        {!hasMarketClearance && (
+          <div className="border-2 border-[#D9381E] bg-[#141414] p-3 text-xs uppercase text-[#D9381E] font-bold">
+            [WINDOW-SHOPPING MODE] // LOG 1 ROADIE SHIFT OR PASS CLEARANCE 01 IN [TRACK] TO UNLOCK REDEEMING (CLEARANCE 02 ADDS -20% DISCOUNT).
+          </div>
+        )}
+
+        {hasMarketDiscount && (
+          <div className="border border-[#33FF00] bg-[#33FF00]/10 px-3 py-1.5 text-[11px] font-bold uppercase text-[#33FF00]">
+            &gt;&gt; NODE 02 PERK ACTIVE: -20% SAMIZDAT DISCOUNT APPLIED TO ALL DROPS
+          </div>
+        )}
+
         {allItems.map((item) => {
-          const canAfford = state.points >= item.cost && item.approved;
+          const finalCost = getEffectiveCost(item.cost);
+          const canAfford = hasMarketClearance && state.points >= finalCost && item.approved;
           return (
             <div
               key={item.id}
@@ -585,7 +899,7 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
               <div className="space-y-1">
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="bg-[#D9381E] text-[#EAE6DF] text-[10px] font-bold px-2 py-0.5 uppercase">
-                    {item.cost} PTS
+                    {finalCost} PTS {hasMarketDiscount ? `(WAS ${item.cost})` : ''}
                   </span>
                   <span className="border border-[#EAE6DF]/50 text-[#EAE6DF] text-[10px] font-bold px-1.5 py-0.5 uppercase">
                     {item.category}
@@ -597,7 +911,7 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
                 <h3 className="text-sm font-bold uppercase text-[#EAE6DF] pt-0.5">{item.title}</h3>
                 <p className="text-xs text-[#EAE6DF]/80 leading-relaxed">{item.description}</p>
 
-                {!item.approved && (
+                {!item.approved && isBandAccount && (
                   <button
                     type="button"
                     onClick={() => toggleApproveItem(item.id)}
@@ -618,7 +932,7 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
                     : 'border-[#EAE6DF]/30 bg-[#0D0D0D] text-[#EAE6DF]/35 cursor-not-allowed'
                 }`}
               >
-                {!item.approved ? '[PENDING]' : canAfford ? '[REDEEM]' : '[LOCKED]'}
+                {!hasMarketClearance ? '[CLEARANCE REQ]' : !item.approved ? '[PENDING]' : canAfford ? '[REDEEM]' : '[LOCKED]'}
               </button>
             </div>
           );

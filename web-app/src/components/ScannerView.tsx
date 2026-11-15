@@ -1,652 +1,587 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { Landmark } from "../types";
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { AccountType, Landmark } from '../types';
 import {
-  compressImageFile,
+  computeFastDHash,
   hammingDistance,
-  hashImageUrl,
-  hashVideoFrameCandidates,
-} from "../utils/geoAndHash";
+  loadScannerSandbox,
+} from '../utils/scannerHash';
 
 interface ScannerViewProps {
   landmarks: Landmark[];
   unlockedIds: string[];
+  accountType: AccountType;
+  hasScanAmplifier: boolean;
   onUnlockSpot: (landmarkId: string) => void;
 }
 
-type CameraStatus = "starting" | "live" | "denied";
+const LOCAL_TEST_REFS: Record<string, string> = {
+  'sfintii-62': './refs/LandmarkTest1.jpg',
+  'progresiv-73': './refs/LandmarkTest2.jpg',
+};
 
-const BAND_NODES_STORAGE_KEY = "frecventa77_band_scan_nodes";
-const MATCH_THRESHOLD = 42;
-
-function FallbackFacade({ reason }: { reason: string }) {
-  return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#141414]">
-      <svg
-        viewBox="0 0 200 140"
-        className="h-3/4 w-3/4 text-[#EAE6DF]"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-      >
-        <rect x="30" y="20" width="140" height="110" />
-        <rect x="20" y="12" width="160" height="8" />
-        {[0, 1, 2].map((row) =>
-          [0, 1, 2, 3].map((col) => (
-            <rect key={`${row}-${col}`} x={42 + col * 32} y={32 + row * 28} width="18" height="18" />
-          ))
-        )}
-        <rect x="88" y="104" width="24" height="26" />
-        <line x1="10" y1="130" x2="190" y2="130" />
-      </svg>
-      <p className="mt-2 px-4 text-center font-mono text-xs uppercase text-[#D9381E]">{reason}</p>
-    </div>
-  );
+function getLightweightRefUrl(spot: Landmark, usePublicRefs: boolean): string {
+  if (usePublicRefs && LOCAL_TEST_REFS[spot.id]) {
+    return LOCAL_TEST_REFS[spot.id];
+  }
+  const url = spot.referenceImageUrl || '';
+  if (!url) return '';
+  if (url.includes('images.unsplash.com')) {
+    return url.replace(/w=\d+/, 'w=420').replace(/q=\d+/, 'q=65');
+  }
+  return url;
 }
 
 export default function ScannerView({
   landmarks,
   unlockedIds,
+  accountType,
+  hasScanAmplifier,
   onUnlockSpot,
 }: ScannerViewProps) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const refHashesRef = useRef<Record<string, string>>({});
+  const sandbox = loadScannerSandbox();
+  const showAdminTestToken = accountType === 'ADMIN' && sandbox.enabled;
 
-  const [camera, setCamera] = useState<CameraStatus>("starting");
+  const adminTestLandmark: Landmark | null = showAdminTestToken
+    ? {
+        id: 'admin-sandbox-test-node',
+        title: `TEST TOKEN // ${sandbox.refLabel || 'CUSTOM CALIBRATION TAG'}`,
+        band: 'ROOT CALIBRATION',
+        era: '2026 // SANDBOX',
+        locationName: 'Admin Field Test / Live Pitch Table',
+        riddle: `Aim live viewfinder at your reference marker (${sandbox.refLabel}) to verify Hamming distance <= ${sandbox.maxHammingDistance} bits.`,
+        story: 'Admin perceptual dHash calibration node.',
+        points: 150,
+        referenceImageUrl: sandbox.refImageDataUrl,
+        createdByType: 'ADMIN',
+      }
+    : null;
+
+  const allLandmarks = adminTestLandmark
+    ? [adminTestLandmark, ...landmarks]
+    : landmarks;
+
+  const [scanCreatorFilter, setScanCreatorFilter] = useState<'ALL' | 'ADMIN' | 'BAND'>('ALL');
+  const [selectedId, setSelectedId] = useState<string>(
+    adminTestLandmark ? adminTestLandmark.id : landmarks[0]?.id || 'sfintii-62'
+  );
+
+  // Lightweight live camera state (anti-counterfeit: live sensor feed only, no static gallery upload)
+  const [cameraActive, setCameraActive] = useState(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
   const [zoom, setZoom] = useState<number>(1);
-  const [genreFilter, setGenreFilter] = useState<string>("ALL");
-  const [selectedId, setSelectedId] = useState<string>(landmarks[0]?.id ?? "");
-  const [liveSimilarity, setLiveSimilarity] = useState<number>(0);
-  const [matchStreak, setMatchStreak] = useState<number>(0);
-  const [openId, setOpenId] = useState<string | null>(null);
-  const [showRefPreview, setShowRefPreview] = useState<boolean>(false);
+  const [hardwareZoomRange, setHardwareZoomRange] = useState<{ min: number; max: number; step: number } | null>(null);
+  const [liveSimilarity, setLiveSimilarity] = useState<number | null>(null);
+  const [liveDistance, setLiveDistance] = useState<number | null>(null);
+  const [verifying, setVerifying] = useState(false);
+  const [feedback, setFeedback] = useState<string | null>(null);
 
-  const [customNodes, setCustomNodes] = useState<Landmark[]>(() => {
-    try {
-      const saved = localStorage.getItem(BAND_NODES_STORAGE_KEY);
-      return saved ? (JSON.parse(saved) as Landmark[]) : [];
-    } catch {
-      return [];
-    }
-  });
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const refHashCacheRef = useRef<Record<string, string>>({});
 
-  const [showBandForm, setShowBandForm] = useState(false);
-  const [bandName, setBandName] = useState("");
-  const [bandGenre, setBandGenre] = useState("Post-Punk / Noise");
-  const [nodeTitle, setNodeTitle] = useState("");
-  const [nodeRiddle, setNodeRiddle] = useState("");
-  const [nodeBio, setNodeBio] = useState("");
-  const [nodeTrackUrl, setNodeTrackUrl] = useState("https://bandcamp.com");
-  const [nodePhotoData, setNodePhotoData] = useState<string>("");
-  const [autoApprove, setAutoApprove] = useState(true);
-  const [portalNotice, setPortalNotice] = useState<string | null>(null);
+  const visibleLandmarks = allLandmarks.filter((s) =>
+    scanCreatorFilter === 'ALL' ? true : (s.createdByType || 'ADMIN') === scanCreatorFilter
+  );
 
-  useEffect(() => {
-    localStorage.setItem(BAND_NODES_STORAGE_KEY, JSON.stringify(customNodes));
-  }, [customNodes]);
+  const activeSpot =
+    visibleLandmarks.find((l) => l.id === selectedId) || visibleLandmarks[0] || allLandmarks[0];
 
-  const allNodes = useMemo(() => [...customNodes, ...landmarks], [customNodes, landmarks]);
+  const activeRefSrc =
+    activeSpot?.id === 'admin-sandbox-test-node'
+      ? sandbox.refImageDataUrl
+      : activeSpot
+      ? getLightweightRefUrl(activeSpot, sandbox.usePublicRefs)
+      : '';
 
-  const availableGenres = useMemo(() => {
-    const set = new Set<string>();
-    allNodes.forEach((n) => {
-      if (n.genre) set.add(n.genre);
-    });
-    return ["ALL", ...Array.from(set)];
-  }, [allNodes]);
-
-  const filteredNodes = useMemo(() => {
-    if (genreFilter === "ALL") return allNodes;
-    return allNodes.filter((n) => n.genre === genreFilter);
-  }, [allNodes, genreFilter]);
-
-  const selected = allNodes.find((l) => l.id === selectedId) ?? filteredNodes[0];
-  const opened = allNodes.find((l) => l.id === openId);
-
-  useEffect(() => {
-    let cancelled = false;
-    async function computeAllHashes() {
-      for (const item of allNodes) {
-        if (!item.referenceImageUrl || refHashesRef.current[item.id]) continue;
-        try {
-          const h = await hashImageUrl(item.referenceImageUrl);
-          if (!cancelled) {
-            refHashesRef.current[item.id] = h;
-          }
-        } catch (err) {
-          console.warn(`Failed to hash reference image for ${item.id}:`, err);
-        }
-      }
-    }
-    void computeAllHashes();
-    return () => {
-      cancelled = true;
-    };
-  }, [allNodes]);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function startCamera() {
-      if (!navigator.mediaDevices?.getUserMedia) {
-        setCamera("denied");
-        return;
-      }
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 1920 } },
-          audio: false,
-        });
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        streamRef.current = stream;
-        setCamera("live");
-      } catch {
-        if (!cancelled) setCamera("denied");
-      }
-    }
-
-    void startCamera();
-
-    return () => {
-      cancelled = true;
-      streamRef.current?.getTracks().forEach((t) => t.stop());
+  const stopCamera = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
-    };
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setCameraActive(false);
+    setLiveSimilarity(null);
+    setLiveDistance(null);
   }, []);
 
-  useEffect(() => {
-    if (camera === "live" && videoRef.current && streamRef.current) {
-      videoRef.current.srcObject = streamRef.current;
-      void videoRef.current.play().catch(() => {});
+  const startCamera = useCallback(async () => {
+    setCameraError(null);
+    setFeedback(null);
+    stopCamera();
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+        },
+        audio: false,
+      });
+      streamRef.current = stream;
+
+      const track = stream.getVideoTracks()[0];
+      if (track && typeof track.getCapabilities === 'function') {
+        const caps = track.getCapabilities() as MediaTrackCapabilities & {
+          zoom?: { min: number; max: number; step: number };
+        };
+        if (caps.zoom && caps.zoom.max > caps.zoom.min) {
+          setHardwareZoomRange({
+            min: caps.zoom.min,
+            max: Math.min(4, caps.zoom.max),
+            step: caps.zoom.step || 0.1,
+          });
+        } else {
+          setHardwareZoomRange(null);
+        }
+      }
+
+      setCameraActive(true);
+      requestAnimationFrame(() => {
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          videoRef.current.play().catch(() => {});
+        }
+      });
+    } catch {
+      setCameraError(
+        'LIVE CAMERA SENSOR UNAVAILABLE — GRANT CAMERA PERMISSION TO VERIFY PHYSICAL LANDMARKS.'
+      );
+      setCameraActive(false);
     }
-  }, [camera]);
+  }, [stopCamera]);
 
-  // Multi-scale live dHash matcher (checks current zoom + a 1.3x tighter inner crop)
   useEffect(() => {
-    if (camera !== "live" || !selected || openId) return;
-    if (selected.isCommunityBand && selected.approved === false) return;
+    return () => stopCamera();
+  }, [stopCamera]);
 
-    const timer = window.setInterval(() => {
-      if (!videoRef.current) return;
-      const targetHash = refHashesRef.current[selected.id];
-      if (!targetHash) return;
-
-      const candidates = [
-        ...hashVideoFrameCandidates(videoRef.current, zoom),
-        ...hashVideoFrameCandidates(videoRef.current, Math.min(3.5, zoom * 1.25)),
-      ];
-      if (candidates.length === 0) return;
-
-      let bestDist = 128;
-      for (const cand of candidates) {
-        const d = hammingDistance(cand, targetHash);
-        if (d < bestDist) bestDist = d;
+  // Apply hardware zoom when supported; digital CSS + ROI crop handles fallback smoothly
+  const handleZoomChange = useCallback(
+    async (nextZoom: number) => {
+      const clamped = Math.max(1, Math.min(4, Number(nextZoom.toFixed(1))));
+      setZoom(clamped);
+      const track = streamRef.current?.getVideoTracks()?.[0];
+      if (track && hardwareZoomRange && typeof track.applyConstraints === 'function') {
+        try {
+          const hwVal = Math.max(
+            hardwareZoomRange.min,
+            Math.min(hardwareZoomRange.max, clamped)
+          );
+          await track.applyConstraints({
+            advanced: [{ zoom: hwVal } as MediaTrackConstraintSet],
+          });
+        } catch {
+          // Digital zoom fallback stays active seamlessly
+        }
       }
+    },
+    [hardwareZoomRange]
+  );
 
-      const similarityPct = Math.max(0, Math.min(100, Math.round(((128 - bestDist) / 128) * 100)));
-      setLiveSimilarity(similarityPct);
+  // Capture a lightweight 160x160 zoomed center ROI from the live video stream
+  const captureLiveRoiCanvas = useCallback((): HTMLCanvasElement | null => {
+    const video = videoRef.current;
+    if (!video || video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
+      return null;
+    }
+    if (!canvasRef.current) {
+      canvasRef.current = document.createElement('canvas');
+      canvasRef.current.width = 160;
+      canvasRef.current.height = 160;
+    }
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return null;
 
-      if (bestDist <= MATCH_THRESHOLD) {
-        setMatchStreak((prev) => {
-          const next = prev + 1;
-          if (next >= 2) {
-            onUnlockSpot(selected.id);
-            setOpenId(selected.id);
-            return 0;
-          }
-          return next;
-        });
-      } else {
-        setMatchStreak(0);
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    const baseSide = Math.min(vw, vh);
+    const effectiveDigitalZoom = hardwareZoomRange ? 1 : zoom;
+    const cropSide = Math.max(32, baseSide / effectiveDigitalZoom);
+    const sx = (vw - cropSide) / 2;
+    const sy = (vh - cropSide) / 2;
+
+    ctx.drawImage(video, sx, sy, cropSide, cropSide, 0, 0, 160, 160);
+    return canvas;
+  }, [hardwareZoomRange, zoom]);
+
+  const getCachedReferenceHash = useCallback(async (src: string): Promise<string> => {
+    if (!src) return '';
+    if (refHashCacheRef.current[src]) return refHashCacheRef.current[src];
+    try {
+      const h = await computeFastDHash(src);
+      if (h.length === 64) {
+        refHashCacheRef.current[src] = h;
       }
-    }, 250);
+      return h;
+    } catch {
+      return '';
+    }
+  }, []);
 
-    return () => window.clearInterval(timer);
-  }, [camera, selected, openId, zoom, onUnlockSpot]);
-
-  function triggerInstantUnlock() {
-    if (!selected) return;
-    if (selected.isCommunityBand && selected.approved === false) {
-      setPortalNotice("[X] NODE PENDING CURATOR APPROVAL");
+  // Lightweight throttled live telemetry pulse (every 500ms while camera is active)
+  useEffect(() => {
+    if (!cameraActive || !activeRefSrc) {
+      setLiveSimilarity(null);
+      setLiveDistance(null);
       return;
     }
-    onUnlockSpot(selected.id);
-    setOpenId(selected.id);
-  }
+    let cancelled = false;
+    const timer = window.setInterval(async () => {
+      if (cancelled) return;
+      const roi = captureLiveRoiCanvas();
+      if (!roi) return;
+      try {
+        const [liveHash, refHash] = await Promise.all([
+          computeFastDHash(roi),
+          getCachedReferenceHash(activeRefSrc),
+        ]);
+        if (!cancelled && liveHash.length === 64 && refHash.length === 64) {
+          const dist = hammingDistance(refHash, liveHash);
+          const sim = Math.max(0, Math.round(((64 - dist) / 64) * 100));
+          setLiveDistance(dist);
+          setLiveSimilarity(sim);
+        }
+      } catch {
+        // Ignore transient frame read issues
+      }
+    }, 500);
 
-  async function handlePhotoUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [cameraActive, activeRefSrc, captureLiveRoiCanvas, getCachedReferenceHash]);
+
+  async function handleVerifyLiveFrame() {
+    if (!activeSpot) return;
+    const roi = captureLiveRoiCanvas();
+    if (!roi) {
+      setFeedback('[X] LIVE SENSOR NOT READY — ENGAGE CAMERA VIEWFINDER FIRST.');
+      return;
+    }
+
+    setVerifying(true);
+    setFeedback(null);
+
     try {
-      const compressed = await compressImageFile(file);
-      setNodePhotoData(compressed);
-    } catch (err) {
-      console.error(err);
-      setPortalNotice("[X] COULD NOT PROCESS REFERENCE PHOTO");
+      const captureHash = await computeFastDHash(roi);
+      if (captureHash.length !== 64) {
+        setFeedback('[X] SENSOR READ ERROR — STABILIZE OPTICS & RETRY.');
+        return;
+      }
+
+      const maxAllowedDist =
+        activeSpot.id === 'admin-sandbox-test-node'
+          ? sandbox.maxHammingDistance
+          : Math.max(18, sandbox.maxHammingDistance || 18);
+
+      if (activeRefSrc) {
+        const refHash = await getCachedReferenceHash(activeRefSrc);
+        if (refHash.length === 64) {
+          const dist = hammingDistance(refHash, captureHash);
+          const similarity = Math.max(0, Math.round(((64 - dist) / 64) * 100));
+
+          if (dist <= maxAllowedDist) {
+            if (
+              activeSpot.id === 'admin-sandbox-test-node' &&
+              !sandbox.awardPointsInLiveDemo
+            ) {
+              setFeedback(
+                `✓ LIVE SANDBOX MATCH (${similarity}% SIMILARITY, DIST ${dist}/64) — CALIBRATION ONLY (NO PTS)`
+              );
+              return;
+            }
+            onUnlockSpot(activeSpot.id);
+            const pts = hasScanAmplifier
+              ? Math.round(activeSpot.points * 1.25)
+              : activeSpot.points;
+            setFeedback(
+              `✓ LIVE SIGNAL LOCKED (${similarity}% MATCH, DIST ${dist}/64) — +${pts} PTS CREDITED!`
+            );
+            return;
+          } else {
+            setFeedback(
+              `[X] LIVE MISMATCH (${similarity}% SIMILARITY, DIST ${dist}/64 > MAX ${maxAllowedDist}) — ZOOM IN OR ALIGN RETICLE TO TARGET.`
+            );
+            return;
+          }
+        }
+      }
+
+      onUnlockSpot(activeSpot.id);
+      const pts = hasScanAmplifier
+        ? Math.round(activeSpot.points * 1.25)
+        : activeSpot.points;
+      setFeedback(`✓ LIVE OPTIC LOCKED (${activeSpot.band.toUpperCase()}): +${pts} PTS CREDITED`);
+    } catch {
+      setFeedback('[X] LIVE FRAME DECODE FAILED.');
+    } finally {
+      setVerifying(false);
     }
   }
-
-  function handleBandApplicationSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    if (!bandName.trim() || !nodeTitle.trim()) return;
-
-    const newNode: Landmark = {
-      id: `band-node-${Date.now()}`,
-      band: bandName.trim(),
-      genre: bandGenre.trim() || "Indie / Underground",
-      title: nodeTitle.trim(),
-      riddle:
-        nodeRiddle.trim() ||
-        `Caută posterul sau stickerul trupei ${bandName.trim()} în zona underground din Timișoara.`,
-      historyText:
-        nodeBio.trim() ||
-        `${bandName.trim()} este o trupă independentă din scena locală timișoreană. Scanează afișele lor din oraș pentru a le descoperi muzica și concertele.`,
-      audioUrl: "./audio/sample.mp3",
-      localCoverUrl: nodeTrackUrl.trim() || "https://bandcamp.com",
-      referenceImageUrl: nodePhotoData || "./refs/LandmarkTest1.jpg",
-      points: 150,
-      isCommunityBand: true,
-      approved: autoApprove,
-    };
-
-    setCustomNodes((prev) => [newNode, ...prev]);
-    setSelectedId(newNode.id);
-    setBandName("");
-    setNodeTitle("");
-    setNodeRiddle("");
-    setNodeBio("");
-    setNodePhotoData("");
-    setShowBandForm(false);
-    setPortalNotice(
-      autoApprove
-        ? `>> BAND SCAN NODE LIVE: ${newNode.band.toUpperCase()}`
-        : `>> APPLICATION SUBMITTED: AWAITING CURATOR APPROVAL`
-    );
-  }
-
-  function toggleApproveNode(id: string) {
-    setCustomNodes((prev) =>
-      prev.map((n) => (n.id === id ? { ...n, approved: !n.approved } : n))
-    );
-  }
-
-  const lockProgress = Math.min(100, Math.round((matchStreak / 2) * 100));
 
   return (
     <div className="space-y-4 font-mono text-[#EAE6DF]">
       <div className="flex items-center justify-between border-b-2 border-[#EAE6DF] pb-2">
-        <h2 className="text-lg font-bold uppercase tracking-widest">// Visual Scanner</h2>
-        <span className="text-[11px] font-bold uppercase text-[#33FF00]">
-          dHASH {camera === "live" ? `${zoom.toFixed(1)}x` : "SIM"}
+        <h2 className="text-base sm:text-lg font-bold uppercase tracking-wider">
+          // LIVE OPTICAL RECON SCANNER
+        </h2>
+        <span className="text-xs font-bold text-[#33FF00]">
+          {unlockedIds.length}/{allLandmarks.length} UNLOCKED
         </span>
       </div>
 
-      {/* Genre / Taste Filter Pills */}
-      <div className="space-y-1">
-        <div className="text-[10px] uppercase text-[#EAE6DF]/70">
-          FILTER BY SCENE / GENRE PREFERENCE:
-        </div>
-        <div className="flex flex-wrap gap-1.5">
-          {availableGenres.map((g) => (
-            <button
-              key={g}
-              type="button"
-              onClick={() => {
-                setGenreFilter(g);
-                const nextList = g === "ALL" ? allNodes : allNodes.filter((n) => n.genre === g);
-                if (nextList[0]) setSelectedId(nextList[0].id);
-              }}
-              className={`border px-2 py-0.5 text-[10px] font-bold uppercase ${
-                genreFilter === g
-                  ? "border-[#33FF00] bg-[#33FF00] text-[#0D0D0D]"
-                  : "border-[#EAE6DF]/40 bg-[#141414] text-[#EAE6DF]/80"
-              }`}
-            >
-              {g}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* Target Node Selector */}
-      <div className="space-y-2 border-2 border-[#EAE6DF] bg-[#141414] p-3">
-        <label className="block text-xs font-bold uppercase">
-          ACTIVE TARGET SIGNAL ({filteredNodes.length}):
-          <select
-            value={selected?.id ?? ""}
-            onChange={(e) => {
-              setSelectedId(e.target.value);
-              setMatchStreak(0);
-            }}
-            className="mt-1 w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs uppercase text-[#EAE6DF]"
+      {/* Origin Filter */}
+      <div className="flex flex-wrap items-center gap-1 border border-[#EAE6DF]/40 bg-[#141414] p-2">
+        <span className="text-[9px] uppercase text-[#EAE6DF]/60 mr-1">ORIGIN:</span>
+        {(
+          [
+            ['ALL', 'ALL NODES'],
+            ['ADMIN', 'ADMIN ARCHIVE'],
+            ['BAND', 'BAND DROPS'],
+          ] as const
+        ).map(([val, label]) => (
+          <button
+            key={val}
+            type="button"
+            onClick={() => setScanCreatorFilter(val)}
+            className={`px-2 py-0.5 text-[9px] font-bold uppercase border ${
+              scanCreatorFilter === val
+                ? 'border-[#33FF00] bg-[#33FF00] text-[#0D0D0D]'
+                : 'border-[#EAE6DF]/30 bg-black text-[#EAE6DF]/75'
+            }`}
           >
-            {filteredNodes.map((l) => (
-              <option key={l.id} value={l.id}>
-                {unlockedIds.includes(l.id) ? "[UNLOCKED] " : "[TARGET] "}
-                {l.band} — {l.title}
-                {l.isCommunityBand && l.approved === false ? " (PENDING)" : ""}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        {selected && (
-          <div className="space-y-1.5 pt-1 text-xs">
-            <div className="flex items-center justify-between text-[11px]">
-              <span className="text-[#33FF00] font-bold uppercase">
-                GENRE: {selected.genre || "UNDERGROUND ROCK"}
-              </span>
-              {selected.referenceImageUrl && (
-                <button
-                  type="button"
-                  onClick={() => setShowRefPreview((p) => !p)}
-                  className="underline text-[#EAE6DF]/80 uppercase text-[10px]"
-                >
-                  {showRefPreview ? "[HIDE HINT PHOTO]" : "[PEEK TARGET PHOTO]"}
-                </button>
-              )}
-            </div>
-            <p className="text-[#EAE6DF]/85 leading-relaxed">{selected.riddle}</p>
-
-            {selected.isCommunityBand && selected.approved === false && (
-              <button
-                type="button"
-                onClick={() => toggleApproveNode(selected.id)}
-                className="border border-[#33FF00] px-2 py-1 text-[10px] font-bold uppercase text-[#33FF00]"
-              >
-                [CURATOR: APPROVE BAND NODE]
-              </button>
-            )}
-
-            {showRefPreview && selected.referenceImageUrl && (
-              <img
-                src={selected.referenceImageUrl}
-                alt={selected.title}
-                className="mt-2 h-40 w-full object-cover border border-[#EAE6DF]/50"
-              />
-            )}
-          </div>
-        )}
+            {label}
+          </button>
+        ))}
       </div>
 
-      {/* Viewfinder */}
-      <div className="relative aspect-[3/4] w-full overflow-hidden border-2 border-[#EAE6DF] bg-black">
-        {camera === "live" && (
-          <video
-            ref={videoRef}
-            playsInline
-            muted
-            style={{ transform: `scale(${zoom})` }}
-            className="absolute inset-0 h-full w-full object-cover origin-center transition-transform duration-100"
-          />
-        )}
-        {camera === "starting" && (
-          <div className="absolute inset-0 flex items-center justify-center text-xs uppercase text-[#33FF00]">
-            &gt;&gt; REQUESTING CAMERA...
-          </div>
-        )}
-        {camera === "denied" && (
-          <FallbackFacade reason="[X] CAMERA OFFLINE // USE GLARE OVERRIDE BELOW" />
-        )}
-
-        {/* Reticle */}
-        <div className="pointer-events-none absolute inset-6 border-2 border-dashed border-[#D9381E]" />
-        <div className="pointer-events-none absolute left-1/2 top-1/2 h-8 w-8 -translate-x-1/2 -translate-y-1/2">
-          <div className="absolute left-1/2 top-0 h-full w-0.5 -translate-x-1/2 bg-[#D9381E]" />
-          <div className="absolute left-0 top-1/2 h-0.5 w-full -translate-y-1/2 bg-[#D9381E]" />
-        </div>
-
-        <p className="pointer-events-none absolute left-0 right-0 top-2 bg-black/70 py-0.5 text-center text-[11px] font-bold uppercase text-[#D9381E]">
-          ALIGN WALL DETAIL / BAND POSTER IN FRAME
-        </p>
-
-        {/* Live dHash Signal Meter */}
-        <div className="pointer-events-none absolute bottom-2 left-2 right-2 bg-black/85 border border-[#EAE6DF]/40 p-2 text-[11px]">
-          <div className="flex justify-between uppercase">
-            <span className="text-[#33FF00]">VISUAL CORRELATION: {liveSimilarity}%</span>
-            <span className="text-[#EAE6DF]">
-              {lockProgress > 0 ? `LOCKING ${lockProgress}%` : "SCANNING..."}
+      {activeSpot && (
+        <div className="border-2 border-[#EAE6DF] bg-[#141414] p-3.5 space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <span className="bg-[#D9381E] px-1.5 py-0.5 text-[10px] font-bold uppercase">
+              TARGET // {activeSpot.era}
+            </span>
+            <span className="text-xs font-bold text-[#33FF00]">
+              +{hasScanAmplifier ? Math.round(activeSpot.points * 1.25) : activeSpot.points} PTS
             </span>
           </div>
-          <div className="mt-1 h-1.5 w-full bg-[#141414]">
-            <div
-              className="h-full bg-[#33FF00] transition-all duration-150"
-              style={{ width: `${Math.max(liveSimilarity, lockProgress)}%` }}
-            />
-          </div>
-        </div>
-      </div>
 
-      {/* Optical / Digital Zoom Control Bar */}
-      {camera === "live" && (
-        <div className="border-2 border-[#EAE6DF] bg-[#141414] p-2.5 space-y-2">
-          <div className="flex items-center justify-between text-xs font-bold uppercase">
-            <span>OPTICAL / DIGITAL ZOOM: {zoom.toFixed(1)}x</span>
-            <div className="flex gap-1.5">
-              {[1, 1.5, 2, 2.5].map((preset) => (
+          <div>
+            <div className="text-sm font-bold uppercase text-[#EAE6DF]">{activeSpot.title}</div>
+            <div className="text-[11px] text-[#33FF00]">📍 {activeSpot.locationName}</div>
+          </div>
+
+          {/* Target Reference Thumbnail */}
+          {activeRefSrc && (
+            <div className="relative border border-[#33FF00]/60 bg-black overflow-hidden">
+              <img
+                src={activeRefSrc}
+                alt={`Reference marker for ${activeSpot.title}`}
+                loading="lazy"
+                decoding="async"
+                onError={(e) => {
+                  const fallback = activeSpot.referenceImageUrl;
+                  if (fallback && e.currentTarget.src !== fallback) {
+                    e.currentTarget.src = fallback;
+                  }
+                }}
+                className="h-32 w-full object-cover grayscale contrast-125 opacity-90"
+              />
+              <div className="absolute top-1.5 left-1.5 bg-black/85 border border-[#33FF00] px-1.5 py-0.5 text-[9px] font-bold uppercase text-[#33FF00]">
+                {activeSpot.id === 'admin-sandbox-test-node'
+                  ? 'ADMIN SANDBOX REFERENCE // MATCH LIVE'
+                  : 'TARGET MARKER // LIVE SENSOR ONLY'}
+              </div>
+              <div className="absolute bottom-1.5 right-1.5 bg-black/85 px-1.5 py-0.5 text-[9px] text-[#EAE6DF]/80">
+                ANTI-SPOOF LIVE DHASH
+              </div>
+            </div>
+          )}
+
+          <p className="border-l-2 border-[#D9381E] pl-2.5 text-xs text-[#EAE6DF]/85">
+            {activeSpot.riddle}
+          </p>
+
+          {/* Live Camera Viewfinder + Zoom Controls */}
+          <div className="border-2 border-[#33FF00] bg-black p-2.5 space-y-2.5">
+            <div className="flex items-center justify-between text-[10px] font-bold uppercase">
+              <span className="text-[#33FF00]">
+                {cameraActive ? '● LIVE OPTIC FEED ACTIVE' : '○ SENSOR STANDBY'}
+              </span>
+              <span className="text-[#EAE6DF]/75">ZOOM: {zoom.toFixed(1)}x</span>
+            </div>
+
+            {cameraActive ? (
+              <div className="relative aspect-square max-h-64 w-full mx-auto overflow-hidden border border-[#EAE6DF]/40 bg-black">
+                <video
+                  ref={videoRef}
+                  playsInline
+                  muted
+                  style={
+                    hardwareZoomRange
+                      ? undefined
+                      : { transform: `scale(${zoom})`, transformOrigin: 'center center' }
+                  }
+                  className="h-full w-full object-cover transition-transform duration-150"
+                />
+                {/* Alignment Reticle Overlay */}
+                <div className="pointer-events-none absolute inset-6 border-2 border-dashed border-[#33FF00]/80 flex items-end justify-between p-1.5">
+                  <span className="bg-black/80 px-1.5 py-0.5 text-[9px] font-bold text-[#33FF00]">
+                    ALIGN MARKER IN RETICLE
+                  </span>
+                  {liveSimilarity !== null && (
+                    <span
+                      className={`px-1.5 py-0.5 text-[9px] font-bold ${
+                        liveSimilarity >= 70
+                          ? 'bg-[#33FF00] text-[#0D0D0D]'
+                          : 'bg-black/85 text-[#EAE6DF]'
+                      }`}
+                    >
+                      LOCK: {liveSimilarity}% ({liveDistance}/64)
+                    </span>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="border border-dashed border-[#EAE6DF]/35 bg-[#0D0D0D] p-4 text-center space-y-2">
+                <div className="text-[11px] text-[#EAE6DF]/75">
+                  Gallery uploads disabled to prevent photo counterfeits. Engage live camera to scan on-site marker.
+                </div>
                 <button
-                  key={preset}
                   type="button"
-                  onClick={() => setZoom(preset)}
-                  className={`border px-2 py-0.5 text-[10px] font-bold ${
-                    Math.abs(zoom - preset) < 0.05
-                      ? "border-[#33FF00] bg-[#33FF00] text-[#0D0D0D]"
-                      : "border-[#EAE6DF]/50 bg-black text-[#EAE6DF]"
+                  onClick={startCamera}
+                  className="border-2 border-[#33FF00] bg-[#33FF00] px-3 py-1.5 text-xs font-bold uppercase text-[#0D0D0D]"
+                >
+                  [📷 ENGAGE LIVE VIEWFINDER]
+                </button>
+              </div>
+            )}
+
+            {/* Optical / Digital Zoom Bar */}
+            {cameraActive && (
+              <div className="space-y-1.5">
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-bold text-[#EAE6DF]/70">ZOOM</span>
+                  <input
+                    type="range"
+                    min={1}
+                    max={4}
+                    step={0.1}
+                    value={zoom}
+                    onChange={(e) => handleZoomChange(parseFloat(e.target.value))}
+                    className="flex-1 accent-[#33FF00]"
+                  />
+                  <div className="flex gap-1">
+                    {[1, 2, 3].map((preset) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        onClick={() => handleZoomChange(preset)}
+                        className={`px-1.5 py-0.5 text-[9px] font-bold border ${
+                          Math.abs(zoom - preset) < 0.15
+                            ? 'border-[#33FF00] bg-[#33FF00] text-[#0D0D0D]'
+                            : 'border-[#EAE6DF]/40 text-[#EAE6DF]'
+                        }`}
+                      >
+                        {preset}x
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-3 gap-2 pt-1">
+                  <button
+                    type="button"
+                    disabled={verifying}
+                    onClick={handleVerifyLiveFrame}
+                    className="col-span-2 border-2 border-[#EAE6DF] bg-[#33FF00] p-2 text-xs font-bold uppercase text-[#0D0D0D] active:translate-y-px"
+                  >
+                    {verifying ? '>> SAMPLING DHASH...' : '[⚡ LOCK & VERIFY LIVE FRAME]'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={stopCamera}
+                    className="border border-[#D9381E] bg-black p-2 text-[10px] font-bold uppercase text-[#D9381E]"
+                  >
+                    [OFF]
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {cameraError && (
+              <div className="border border-[#D9381E] bg-[#141414] p-2 text-[11px] font-bold text-[#D9381E]">
+                {cameraError}
+              </div>
+            )}
+          </div>
+
+          {feedback && (
+            <div
+              className={`border p-2 text-xs font-bold ${
+                feedback.startsWith('✓')
+                  ? 'border-[#33FF00] bg-black text-[#33FF00]'
+                  : 'border-[#D9381E] bg-black text-[#D9381E]'
+              }`}
+            >
+              {feedback}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Target Node Selector */}
+      <div className="space-y-2">
+        <div className="text-[10px] font-bold uppercase text-[#EAE6DF]/60">
+          SELECT TARGET NODE ({visibleLandmarks.length})
+        </div>
+        {visibleLandmarks.map((spot) => {
+          const isUnlocked = unlockedIds.includes(spot.id);
+          const isSelected = activeSpot?.id === spot.id;
+          return (
+            <button
+              key={spot.id}
+              type="button"
+              onClick={() => {
+                setSelectedId(spot.id);
+                setFeedback(null);
+              }}
+              className={`w-full text-left border-2 p-2.5 ${
+                isSelected
+                  ? 'border-[#33FF00] bg-[#141414]'
+                  : 'border-[#EAE6DF]/35 bg-[#0D0D0D]'
+              }`}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-bold uppercase text-[#EAE6DF]">{spot.title}</span>
+                <span
+                  className={`text-[10px] font-bold uppercase ${
+                    isUnlocked ? 'text-[#33FF00]' : 'text-[#D9381E]'
                   }`}
                 >
-                  {preset}x
-                </button>
-              ))}
-            </div>
-          </div>
-          <input
-            type="range"
-            min={1}
-            max={3}
-            step={0.1}
-            value={zoom}
-            onChange={(e) => setZoom(Number(e.target.value))}
-            className="w-full accent-[#33FF00]"
-          />
-        </div>
-      )}
-
-      {/* Manual / Table-Side Demo Trigger */}
-      <button
-        type="button"
-        onClick={triggerInstantUnlock}
-        className="w-full rounded-none border-2 border-[#EAE6DF] bg-[#D9381E] p-3 text-xs sm:text-sm font-bold uppercase tracking-widest text-[#EAE6DF]"
-      >
-        [GLARE OVERRIDE // MANUAL VERIFY]
-      </button>
-
-      {/* Band / Artist Scan Node Application Portal */}
-      <div className="border-2 border-[#EAE6DF] bg-[#141414] p-3">
-        <button
-          type="button"
-          onClick={() => setShowBandForm((prev) => !prev)}
-          className="flex w-full items-center justify-between text-left text-xs font-bold uppercase tracking-wider text-[#33FF00]"
-        >
-          <span>[+ BAND NODE PORTAL] APPLY TO ADD SCAN POSTER / SPOT</span>
-          <span>{showBandForm ? "[-]" : "[+]"}</span>
-        </button>
-
-        {showBandForm && (
-          <form
-            onSubmit={handleBandApplicationSubmit}
-            className="mt-3 space-y-2.5 border-t border-[#EAE6DF]/30 pt-3"
-          >
-            <p className="text-[11px] text-[#EAE6DF]/80 leading-relaxed">
-              Are you an underground Timișoara band? Upload a photo of your street poster,
-              sticker, or rehearsal door so fans of your genre can hunt it down and discover your
-              music live.
-            </p>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              <div>
-                <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
-                  BAND NAME *
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={bandName}
-                  onChange={(e) => setBandName(e.target.value)}
-                  placeholder="EX: HĂLĂCIUGĂ"
-                  className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
-                />
+                  {isUnlocked ? '✓ UNLOCKED' : `+${spot.points} PTS`}
+                </span>
               </div>
-
-              <div>
-                <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
-                  SUBGENRE / SOUND *
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={bandGenre}
-                  onChange={(e) => setBandGenre(e.target.value)}
-                  placeholder="EX: Post-Punk / Sludge"
-                  className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
-                />
+              <div className="mt-0.5 flex items-center justify-between text-[10px] text-[#EAE6DF]/65">
+                <span>
+                  {spot.band} • {spot.locationName}
+                </span>
+                <span>
+                  {spot.id === 'admin-sandbox-test-node'
+                    ? 'SANDBOX'
+                    : spot.createdByType === 'BAND'
+                    ? 'BAND'
+                    : 'ARCHIVE'}
+                </span>
               </div>
-            </div>
-
-            <div>
-              <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
-                SPOT / POSTER TITLE *
-              </label>
-              <input
-                type="text"
-                required
-                value={nodeTitle}
-                onChange={(e) => setNodeTitle(e.target.value)}
-                placeholder="EX: Afiș Lansare EP — Zona Unirii"
-                className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
-              />
-            </div>
-
-            <div>
-              <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
-                LOCATION RIDDLE / CLUE
-              </label>
-              <input
-                type="text"
-                value={nodeRiddle}
-                onChange={(e) => setNodeRiddle(e.target.value)}
-                placeholder="Lângă gangul spre subsolul de repetiții..."
-                className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
-              />
-            </div>
-
-            <div>
-              <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
-                BAND BIO &amp; UPCOMING GIG INFO
-              </label>
-              <textarea
-                rows={2}
-                value={nodeBio}
-                onChange={(e) => setNodeBio(e.target.value)}
-                placeholder="Cine sunteți, ce cântați și unde aveți următorul concert..."
-                className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
-              />
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              <div>
-                <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
-                  BANDCAMP / TRACK LINK
-                </label>
-                <input
-                  type="url"
-                  value={nodeTrackUrl}
-                  onChange={(e) => setNodeTrackUrl(e.target.value)}
-                  placeholder="https://..."
-                  className="w-full rounded-none border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
-                />
-              </div>
-
-              <div>
-                <label className="block text-[10px] uppercase text-[#EAE6DF]/70 mb-1">
-                  POSTER / WALL REFERENCE PHOTO
-                </label>
-                <input
-                  type="file"
-                  accept="image/*"
-                  capture="environment"
-                  onChange={handlePhotoUpload}
-                  className="w-full border-2 border-[#EAE6DF] bg-black p-1.5 text-[10px] text-[#EAE6DF]"
-                />
-              </div>
-            </div>
-
-            <label className="flex items-center justify-between border border-dashed border-[#EAE6DF]/40 bg-black p-2 text-[11px] cursor-pointer">
-              <span className="uppercase text-[#EAE6DF]/80">
-                [CURATOR MODE] Auto-Approve Scan Node
-              </span>
-              <input
-                type="checkbox"
-                checked={autoApprove}
-                onChange={(e) => setAutoApprove(e.target.checked)}
-                className="h-4 w-4 accent-[#33FF00]"
-              />
-            </label>
-
-            <button
-              type="submit"
-              className="w-full rounded-none border-2 border-[#EAE6DF] bg-[#33FF00] p-2 text-xs font-bold uppercase tracking-wider text-[#0D0D0D]"
-            >
-              SUBMIT &amp; REGISTER SCAN NODE
             </button>
-          </form>
-        )}
+          );
+        })}
       </div>
-
-      {portalNotice && (
-        <div className="border border-[#33FF00] bg-[#141414] p-2 text-xs uppercase text-[#33FF00]">
-          {portalNotice}
-        </div>
-      )}
-
-      {/* Result modal */}
-      {opened && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
-          <div className="max-h-full w-full max-w-md overflow-y-auto border-2 border-[#0D0D0D] bg-[#EAE6DF] p-4 text-[#0D0D0D]">
-            <p className="inline-block -rotate-2 border-2 border-[#D9381E] px-2 py-0.5 text-xs font-bold uppercase text-[#D9381E]">
-              SIGNAL LOCKED // +{opened.points} PTS
-            </p>
-            <h3 className="mt-3 text-xl font-bold uppercase">{opened.title}</h3>
-            <p className="text-xs font-bold uppercase">
-              {opened.band} {opened.genre ? `// ${opened.genre}` : ""}
-            </p>
-            <p className="mt-3 text-sm leading-relaxed">{opened.historyText}</p>
-
-            <audio controls src={opened.audioUrl} className="mt-3 w-full">
-              Your browser does not support audio.
-            </audio>
-
-            <a
-              href={opened.localCoverUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="mt-3 block rounded-none border-2 border-[#0D0D0D] bg-[#D9381E] p-2 text-center text-sm font-bold uppercase text-[#EAE6DF]"
-            >
-              &gt;&gt; LISTEN / FOLLOW BAND ONLINE
-            </a>
-
-            <button
-              type="button"
-              onClick={() => setOpenId(null)}
-              className="mt-3 w-full rounded-none border-2 border-[#0D0D0D] bg-[#0D0D0D] p-2 text-sm font-bold uppercase text-[#EAE6DF]"
-            >
-              [X] Close file
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
