@@ -6,6 +6,12 @@ import { PassAndMarket } from './components/PassAndMarket';
 import ScannerView from './components/ScannerView';
 import ArchiveAndQuiz from './components/ArchiveAndQuiz';
 import CommsRoom from './components/CommsRoom';
+import {
+  loadActiveSessionProfile,
+  logoutOperative,
+  syncProfileState,
+  type ProfileRecord,
+} from './utils/supabaseClient';
 
 const STORAGE_KEY = 'frecventa77_state';
 
@@ -32,22 +38,64 @@ export function App() {
     return INITIAL_STATE;
   });
 
+  const [checkingSession, setCheckingSession] = useState(true);
   const [activeTab, setActiveTab] = useState<ActiveTab>('SCANNER');
 
+  // Verify active Supabase session on boot and sync profile from DB
   useEffect(() => {
+    let active = true;
+    loadActiveSessionProfile()
+      .then((profile) => {
+        if (!active) return;
+        if (profile) {
+          setState({
+            unlocked: true,
+            handle: profile.handle,
+            points: profile.points,
+            unlockedIds: profile.unlocked_ids || [],
+            quizCompleted: Boolean(profile.quiz_completed),
+          });
+        } else {
+          // Require real account login if no valid non-anonymous Supabase session exists
+          localStorage.removeItem(STORAGE_KEY);
+          setState(INITIAL_STATE);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          localStorage.removeItem(STORAGE_KEY);
+          setState(INITIAL_STATE);
+        }
+      })
+      .finally(() => {
+        if (active) setCheckingSession(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (checkingSession) return;
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     } catch (err) {
       console.error('Failed to save state to localStorage:', err);
     }
-  }, [state]);
+    if (state.unlocked) {
+      void syncProfileState(state);
+    }
+  }, [state, checkingSession]);
 
-  const unlockApp = (handle: string) => {
-    setState((prev) => ({
-      ...prev,
+  const handleAuthenticated = (profile: ProfileRecord) => {
+    setState({
       unlocked: true,
-      handle: handle.trim() || 'OPERATIVE-77',
-    }));
+      handle: profile.handle,
+      points: profile.points,
+      unlockedIds: profile.unlocked_ids || [],
+      quizCompleted: Boolean(profile.quiz_completed),
+    });
   };
 
   const unlockSpot = (landmarkId: string) => {
@@ -89,14 +137,25 @@ export function App() {
     return true;
   };
 
-  const resetDemo = () => {
+  const handleSignOut = async () => {
+    await logoutOperative();
     localStorage.removeItem(STORAGE_KEY);
     setState(INITIAL_STATE);
     setActiveTab('SCANNER');
   };
 
+  if (checkingSession) {
+    return (
+      <div className="min-h-screen samizdat-bg text-[#33FF00] font-mono flex items-center justify-center p-4">
+        <div className="border-2 border-[#EAE6DF] bg-[#141414] px-6 py-4 text-xs uppercase tracking-widest">
+          &gt;&gt; VERIFYING CARRIER SESSION...
+        </div>
+      </div>
+    );
+  }
+
   if (!state.unlocked) {
-    return <Gatekeeper onUnlock={unlockApp} />;
+    return <Gatekeeper onAuthenticated={handleAuthenticated} />;
   }
 
   const navItems: { id: ActiveTab; label: string }[] = [
@@ -118,7 +177,7 @@ export function App() {
               <h1 className="text-base font-bold tracking-wider uppercase">FRECVENȚA 77</h1>
             </div>
             <div className="text-[11px] text-[#EAE6DF]/70 uppercase">
-              ID: {state.handle} // TM-UNDERGROUND
+              ID: @{state.handle} // VERIFIED
             </div>
           </div>
           <div className="border-2 border-[#33FF00] bg-[#0D0D0D] px-2.5 py-1 text-right">
@@ -171,15 +230,15 @@ export function App() {
           />
         )}
 
-        {/* Footer with Reset Signal Trigger */}
+        {/* Footer with Sign Out Trigger */}
         <footer className="pt-4 border-t border-[#EAE6DF]/20 flex items-center justify-between text-[11px] text-[#EAE6DF]/50">
           <span>SAMIZDAT BROADCAST // 1977–2026</span>
           <button
             type="button"
-            onClick={resetDemo}
+            onClick={handleSignOut}
             className="text-[#D9381E] hover:underline uppercase font-bold tracking-wider"
           >
-            [RESET SIGNAL]
+            [SIGN OUT]
           </button>
         </footer>
       </main>

@@ -1,11 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import { Landmark, UserState } from '../types';
+import { burnOperativeAccount } from '../utils/supabaseClient';
 
 interface PassAndMarketProps {
   mode: 'PASS' | 'MARKET';
   state: UserState;
   landmarks: Landmark[];
   onSpendPoints: (cost: number) => boolean;
+  onAccountBurned?: () => void;
 }
 
 type RewardCategory = 'GIG TICKET' | 'MERCH VOUCHER' | 'BACKSTAGE PASS' | 'CUSTOM TOKEN';
@@ -93,11 +95,14 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
   state,
   landmarks,
   onSpendPoints,
+  onAccountBurned,
 }) => {
   const [copied, setCopied] = useState(false);
   const [marketNotice, setMarketNotice] = useState<string | null>(null);
+  const [confirmBurn, setConfirmBurn] = useState(false);
+  const [burning, setBurning] = useState(false);
+  const [burnError, setBurnError] = useState<string | null>(null);
 
-  // Custom Band Rewards persisted in localStorage
   const [customItems, setCustomItems] = useState<MarketItem[]>(() => {
     try {
       const saved = localStorage.getItem(CUSTOM_ITEMS_KEY);
@@ -107,7 +112,6 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
     }
   });
 
-  // Redeemed Vouchers persisted in localStorage
   const [vouchers, setVouchers] = useState<RedeemedVoucher[]>(() => {
     try {
       const saved = localStorage.getItem(VOUCHERS_KEY);
@@ -117,7 +121,6 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
     }
   });
 
-  // Band / Artist Application Drawer State
   const [showBandPortal, setShowBandPortal] = useState(false);
   const [bandName, setBandName] = useState('');
   const [category, setCategory] = useState<RewardCategory>('GIG TICKET');
@@ -145,6 +148,24 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
     } catch {
       setCopied(true);
       setTimeout(() => setCopied(false), 2200);
+    }
+  };
+
+  const handleBurnAccount = async () => {
+    setBurning(true);
+    setBurnError(null);
+    try {
+      await burnOperativeAccount(state.handle);
+      localStorage.removeItem('frecventa77_user_state_v1');
+      localStorage.removeItem(VOUCHERS_KEY);
+      if (onAccountBurned) {
+        onAccountBurned();
+      } else {
+        window.location.reload();
+      }
+    } catch (err) {
+      setBurnError(err instanceof Error ? err.message.toUpperCase() : 'FAILED TO ERASE PROFILE');
+      setBurning(false);
     }
   };
 
@@ -352,6 +373,64 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
             </div>
           </section>
         )}
+
+        {/* Counter-Surveillance / Permanent Account Self-Destruct */}
+        <section className="border-2 border-[#D9381E] bg-[#141414] p-4 space-y-3 rounded-none">
+          <div className="flex items-center justify-between border-b border-[#D9381E]/40 pb-2">
+            <span className="text-xs font-bold uppercase tracking-wider text-[#D9381E]">
+              [COUNTER-SURVEILLANCE // DEMAGNETIZE TAPE]
+            </span>
+            <span className="border border-[#D9381E] px-1.5 py-0.5 text-[10px] font-bold text-[#D9381E] uppercase">
+              IRREVERSIBLE
+            </span>
+          </div>
+
+          <p className="text-[11px] text-[#EAE6DF]/80 leading-relaxed">
+            Wipes your operative dossier, password hash, and signal credits from the central
+            archive completely—leaving zero dead profiles behind and freeing{' '}
+            <span className="font-bold text-[#EAE6DF]">@{state.handle.toUpperCase()}</span>.
+          </p>
+
+          {burnError && (
+            <div className="border border-[#D9381E] bg-[#D9381E]/20 p-2 text-[11px] font-bold text-[#D9381E] uppercase">
+              &gt;&gt; {burnError}
+            </div>
+          )}
+
+          {!confirmBurn ? (
+            <button
+              type="button"
+              onClick={() => setConfirmBurn(true)}
+              className="w-full border-2 border-[#D9381E] bg-black px-3 py-2.5 text-xs font-bold uppercase tracking-wider text-[#D9381E] hover:bg-[#D9381E] hover:text-[#EAE6DF] transition-colors rounded-none"
+            >
+              [BURN DOSSIER // PURGE OPERATIVE]
+            </button>
+          ) : (
+            <div className="space-y-2 border-2 border-[#D9381E] bg-[#D9381E]/10 p-3">
+              <div className="text-[11px] font-bold uppercase text-[#EAE6DF]">
+                CONFIRM TAPE DEMAGNETIZATION FOR @{state.handle.toUpperCase()}?
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  disabled={burning}
+                  onClick={() => setConfirmBurn(false)}
+                  className="border-2 border-[#EAE6DF] bg-black py-2 text-xs font-bold uppercase text-[#EAE6DF]"
+                >
+                  [ABORT]
+                </button>
+                <button
+                  type="button"
+                  disabled={burning}
+                  onClick={handleBurnAccount}
+                  className="border-2 border-[#EAE6DF] bg-[#D9381E] py-2 text-xs font-bold uppercase text-[#EAE6DF]"
+                >
+                  {burning ? '[PURGING...]' : '[CONFIRM BURN]'}
+                </button>
+              </div>
+            </div>
+          )}
+        </section>
       </div>
     );
   }
@@ -359,7 +438,6 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
   // BLACK MARKET + BAND TOKEN CREATOR VIEW
   return (
     <div className="space-y-5">
-      {/* Header Banner */}
       <div className="border-2 border-[#EAE6DF] bg-[#141414] p-4 flex items-center justify-between">
         <div>
           <div className="text-xs font-bold uppercase text-[#D9381E] tracking-wider">
@@ -375,7 +453,6 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
         </div>
       </div>
 
-      {/* Band / Artist Token & Reward Creator Toggle */}
       <div className="border-2 border-[#EAE6DF] bg-[#141414] p-3">
         <button
           type="button"
@@ -497,7 +574,6 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
         </div>
       )}
 
-      {/* Redeemable Underground & Band Rewards */}
       <div className="space-y-3">
         {allItems.map((item) => {
           const canAfford = state.points >= item.cost && item.approved;
@@ -549,7 +625,6 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
         })}
       </div>
 
-      {/* Stamped Samizdat Voucher Tickets */}
       {vouchers.length > 0 && (
         <div className="space-y-3 pt-2">
           <div className="text-xs font-bold uppercase text-[#33FF00] tracking-wider">

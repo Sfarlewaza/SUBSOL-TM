@@ -1,18 +1,22 @@
 export interface Landmark {
   id: string;
-  band: string;          // e.g., "Sfinții / Phoenix (1962–1977)"
-  title: string;         // e.g., "Boxele Marshall"
-  riddle: string;        // Clue to find the spot
-  historyText: string;   // Short historical archive text
-  audioUrl: string;      // Path or URL to audio snippet
-  localCoverUrl: string; // Link to modern Timișoara underground band cover
-  points: number;        // e.g., 150
+  band: string;
+  genre?: string;
+  title: string;
+  riddle: string;
+  historyText: string;
+  audioUrl: string;
+  localCoverUrl: string;
+  referenceImageUrl?: string;
+  points: number;
+  isCommunityBand?: boolean;
+  approved?: boolean;
 }
 
 export interface UserState {
   unlocked: boolean;
   handle: string;
   points: number;
-  unlockedIds: string[]; // Array of unlocked Landmark.id strings
+  unlockedIds: string[];
   quizCompleted: boolean;
 }
