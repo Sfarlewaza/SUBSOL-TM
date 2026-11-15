@@ -1,17 +1,22 @@
-import React, { useState } from 'react';
+import React, { useState } from "react";
+import type { AccountType } from "../types";
+import {
+  loginOperative,
+  registerOperative,
+  type ProfileRecord,
+} from "../utils/supabaseClient";
 
 interface GatekeeperProps {
-  onUnlock: (handle: string) => void;
+  onAuthenticated: (profile: ProfileRecord) => void;
 }
 
-// Timișoara Genesis Coordinates (Casa de Cultură a Studenților / Central Zone)
 const TIMISOARA_LAT = 45.7489;
 const TIMISOARA_LON = 21.2087;
-const MAX_DISTANCE_KM = 15; // Generous city-wide radius for live field testing
+const MAX_DISTANCE_KM = 15;
 
 function calculateDistanceKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const toRad = (deg: number) => (deg * Math.PI) / 180;
-  const R = 6371; // Earth radius in km
+  const R = 6371;
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
   const a =
@@ -21,96 +26,134 @@ function calculateDistanceKm(lat1: number, lon1: number, lat2: number, lon2: num
   return R * c;
 }
 
-export const Gatekeeper: React.FC<GatekeeperProps> = ({ onUnlock }) => {
-  const [handleInput, setHandleInput] = useState('');
-  const [passphrase, setPassphrase] = useState('');
+export const Gatekeeper: React.FC<GatekeeperProps> = ({ onAuthenticated }) => {
+  const [authMode, setAuthMode] = useState<"LOGIN" | "REGISTER">("LOGIN");
+  const [accountType, setAccountType] = useState<AccountType>("OPERATIVE");
+  const [handleInput, setHandleInput] = useState("");
+  const [passwordInput, setPasswordInput] = useState("");
+  const [passphrase, setPassphrase] = useState("");
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
-  const [statusType, setStatusType] = useState<'error' | 'info' | 'success'>('info');
-  const [isLocating, setIsLocating] = useState(false);
+  const [statusType, setStatusType] = useState<"error" | "info" | "success">("info");
+  const [isBusy, setIsBusy] = useState(false);
 
-  const validateHandle = (): string | null => {
-    const trimmed = handleInput.trim();
-    if (!trimmed) {
-      setStatusType('error');
-      setStatusMessage('ACCESS DENIED // OPERATIVE HANDLE REQUIRED BEFORE TUNING');
+  const validateCredentials = (): { handle: string; password: string } | null => {
+    const cleanHandle = handleInput.trim().replace(/^@+/, "");
+    if (cleanHandle.length < 3) {
+      setStatusType("error");
+      setStatusMessage("HANDLE REQUIRED (MIN 3 CHARS)");
       return null;
     }
-    return trimmed;
+    if (passwordInput.length < 6) {
+      setStatusType("error");
+      setStatusMessage("PASSWORD REQUIRED (MIN 6 CHARS)");
+      return null;
+    }
+    return { handle: cleanHandle, password: passwordInput };
   };
 
-  const triggerUnlockSuccess = (validHandle: string, sourceLabel: string) => {
-    setStatusType('success');
-    setStatusMessage(`SIGNAL LOCKED (${sourceLabel}) // WELCOME TO THE UNDERGROUND`);
-    setTimeout(() => {
-      onUnlock(validHandle);
-    }, 550);
+  const completeAccountCreation = async (sourceLabel: string) => {
+    const creds = validateCredentials();
+    if (!creds) return;
+
+    setIsBusy(true);
+    setStatusType("info");
+    setStatusMessage(`MINTING ${accountType} CREDENTIALS (${sourceLabel})...`);
+
+    try {
+      const profile = await registerOperative(creds.handle, creds.password, accountType);
+      setStatusType("success");
+      setStatusMessage(
+        `${accountType} ACCOUNT CREATED // WELCOME @${profile.handle.toUpperCase()}`
+      );
+      setTimeout(() => onAuthenticated(profile), 450);
+    } catch (err) {
+      setStatusType("error");
+      setStatusMessage(
+        err && typeof err === "object" && "message" in err
+          ? String((err as { message: string }).message).toUpperCase()
+          : "REGISTRATION FAILED"
+      );
+    } finally {
+      setIsBusy(false);
+    }
   };
 
-  const handlePassphraseSubmit = (e: React.FormEvent) => {
+  const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const validHandle = validateHandle();
-    if (!validHandle) return;
+    const creds = validateCredentials();
+    if (!creds) return;
 
-    if (passphrase.trim().toUpperCase() !== 'MARSHALL77') {
-      setStatusType('error');
-      setStatusMessage('ACCESS DENIED // INVALID FREQUENCY');
+    setIsBusy(true);
+    setStatusType("info");
+    setStatusMessage("AUTHENTICATING FREQUENCY CREDENTIALS...");
+
+    try {
+      const profile = await loginOperative(creds.handle, creds.password);
+      setStatusType("success");
+      setStatusMessage(`SIGNAL LOCKED // WELCOME BACK @${profile.handle.toUpperCase()}`);
+      setTimeout(() => onAuthenticated(profile), 400);
+    } catch (err) {
+      setStatusType("error");
+      setStatusMessage(err instanceof Error ? err.message.toUpperCase() : "SIGN IN FAILED");
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleRegisterPassphrase = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (passphrase.trim().toUpperCase() !== "MARSHALL77") {
+      setStatusType("error");
+      setStatusMessage("ACCESS DENIED // INVALID SCENE KEY (TRY MARSHALL77 OR GPS)");
       return;
     }
-
-    triggerUnlockSuccess(validHandle, 'KEY: MARSHALL77');
+    await completeAccountCreation("KEY: MARSHALL77");
   };
 
   const handleGpsVerification = () => {
-    const validHandle = validateHandle();
-    if (!validHandle) return;
+    const creds = validateCredentials();
+    if (!creds) return;
 
-    if (!('geolocation' in navigator)) {
-      setStatusType('error');
-      setStatusMessage('HARDWARE FAULT // GEOLOCATION UNAVAILABLE ON TERMINAL');
+    if (!("geolocation" in navigator)) {
+      setStatusType("error");
+      setStatusMessage("HARDWARE FAULT // GEOLOCATION UNAVAILABLE ON TERMINAL");
       return;
     }
 
-    setIsLocating(true);
-    setStatusType('info');
-    setStatusMessage('TRIANGULATING SECTOR 45.7489° N, 21.2087° E...');
+    setIsBusy(true);
+    setStatusType("info");
+    setStatusMessage("TRIANGULATING SECTOR 45.7489° N, 21.2087° E...");
 
     navigator.geolocation.getCurrentPosition(
       (position) => {
-        setIsLocating(false);
         const { latitude, longitude } = position.coords;
         const dist = calculateDistanceKm(latitude, longitude, TIMISOARA_LAT, TIMISOARA_LON);
 
         if (dist <= MAX_DISTANCE_KM) {
-          triggerUnlockSuccess(validHandle, `GPS VERIFIED: ${dist.toFixed(1)}KM`);
+          void completeAccountCreation(`GPS: ${dist.toFixed(1)}KM`);
         } else {
-          setStatusType('error');
+          setIsBusy(false);
+          setStatusType("error");
           setStatusMessage(
             `ACCESS DENIED // OUT OF RANGE (${dist.toFixed(1)}KM FROM TIMIȘOARA GENESIS NODE)`
           );
         }
       },
       (err) => {
-        setIsLocating(false);
-        setStatusType('error');
+        setIsBusy(false);
+        setStatusType("error");
         setStatusMessage(
-          `GPS SIGNAL BLOCKED (${err.message.toUpperCase()}) // USE SIMULATE BYPASS OR PASSPHRASE`
+          `GPS BLOCKED (${err.message.toUpperCase()}) // USE SIMULATE GPS OR SCENE KEY`
         );
       },
       { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
     );
   };
 
-  const handleSimulateGps = () => {
-    const validHandle = validateHandle();
-    if (!validHandle) return;
-
-    triggerUnlockSuccess(validHandle, 'SIMULATED VENUE GPS');
-  };
-
   return (
     <div className="min-h-screen samizdat-bg text-[#EAE6DF] font-mono flex flex-col justify-center p-4">
-      <div className="max-w-lg w-full mx-auto border-2 border-[#EAE6DF] bg-[#141414] p-5 sm:p-6 space-y-6 rounded-none">
-        {/* Stark Terminal Banner */}
+      <div className="max-w-lg w-full mx-auto border-2 border-[#EAE6DF] bg-[#141414] p-5 sm:p-6 space-y-5 rounded-none">
+        {/* Banner */}
         <div className="border-b-2 border-[#D9381E] pb-4 space-y-2">
           <div className="flex items-center justify-between gap-2">
             <span className="bg-[#D9381E] text-[#EAE6DF] text-[11px] font-bold px-2 py-0.5 uppercase tracking-wider">
@@ -119,104 +162,212 @@ export const Gatekeeper: React.FC<GatekeeperProps> = ({ onUnlock }) => {
             <span className="text-[11px] text-[#EAE6DF]/60 uppercase">CH-77 // TM</span>
           </div>
           <h1 className="text-lg sm:text-xl font-bold tracking-tight uppercase text-[#EAE6DF] leading-snug">
-            SIGNAL OFFLINE // RESTRICTED FREQUENCY — TIMIȘOARA &apos;77
+            FRECVENȚA 77 // OPERATIVE ACCESS
           </h1>
           <p className="text-xs text-[#EAE6DF]/75 uppercase">
-            IDENTIFY OPERATIVE HANDLE AND AUTHENTICATE VIA GENESIS COORDINATES OR SCENE KEY.
+            SIGN IN WITH YOUR REGISTERED HANDLE OR CREATE A NEW SCENE ACCOUNT.
           </p>
         </div>
 
-        {/* Status / Error Console */}
+        {/* Mode Switcher Tabs */}
+        <div className="grid grid-cols-2 border-2 border-[#EAE6DF]">
+          <button
+            type="button"
+            onClick={() => {
+              setAuthMode("LOGIN");
+              setStatusMessage(null);
+            }}
+            className={`py-2.5 text-xs font-bold uppercase transition-colors ${
+              authMode === "LOGIN"
+                ? "bg-[#33FF00] text-[#0D0D0D]"
+                : "bg-[#0D0D0D] text-[#EAE6DF] hover:bg-[#EAE6DF]/10"
+            }`}
+          >
+            [SIGN IN]
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setAuthMode("REGISTER");
+              setStatusMessage(null);
+            }}
+            className={`border-l-2 border-[#EAE6DF] py-2.5 text-xs font-bold uppercase transition-colors ${
+              authMode === "REGISTER"
+                ? "bg-[#D9381E] text-[#EAE6DF]"
+                : "bg-[#0D0D0D] text-[#EAE6DF] hover:bg-[#EAE6DF]/10"
+            }`}
+          >
+            [CREATE ACCOUNT]
+          </button>
+        </div>
+
+        {/* Status Console */}
         {statusMessage && (
           <div
             role="status"
             className={`border-2 p-3 text-xs font-bold uppercase tracking-wide rounded-none ${
-              statusType === 'error'
-                ? 'border-[#D9381E] bg-[#D9381E]/15 text-[#D9381E]'
-                : statusType === 'success'
-                ? 'border-[#33FF00] bg-[#33FF00]/15 text-[#33FF00] phosphor-glow'
-                : 'border-[#EAE6DF] bg-[#0D0D0D] text-[#EAE6DF]'
+              statusType === "error"
+                ? "border-[#D9381E] bg-[#D9381E]/15 text-[#D9381E]"
+                : statusType === "success"
+                ? "border-[#33FF00] bg-[#33FF00]/15 text-[#33FF00] phosphor-glow"
+                : "border-[#EAE6DF] bg-[#0D0D0D] text-[#EAE6DF]"
             }`}
           >
             &gt;&gt; {statusMessage}
           </div>
         )}
 
-        {/* Step 1: Operative Handle */}
-        <div className="space-y-1.5">
-          <label htmlFor="operative-handle" className="block text-xs font-bold uppercase">
-            01 // OPERATIVE HANDLE (REQUIRED):
-          </label>
-          <input
-            id="operative-handle"
-            type="text"
-            value={handleInput}
-            onChange={(e) => {
-              setHandleInput(e.target.value);
-              if (statusType === 'error') setStatusMessage(null);
-            }}
-            placeholder="@andrei"
-            autoComplete="off"
-            className="w-full bg-[#0D0D0D] border-2 border-[#EAE6DF] px-3 py-2.5 text-sm text-[#33FF00] placeholder-[#EAE6DF]/35 focus:outline-none focus:border-[#33FF00] rounded-none"
-          />
-        </div>
-
-        {/* Step 2A: Genesis Location Check + Demo Fallback */}
-        <div className="border-t-2 border-[#EAE6DF]/20 pt-4 space-y-2">
-          <div className="flex items-center justify-between text-xs font-bold uppercase">
-            <span>02A // GENESIS LOCATION CHECK</span>
-            <span className="text-[11px] text-[#EAE6DF]/60">45.7489° N, 21.2087° E</span>
-          </div>
-          <div className="flex flex-col sm:flex-row gap-2">
-            <button
-              type="button"
-              disabled={isLocating}
-              onClick={handleGpsVerification}
-              className="flex-1 bg-[#0D0D0D] text-[#33FF00] border-2 border-[#33FF00] px-3 py-2.5 text-xs font-bold uppercase hover:bg-[#33FF00] hover:text-[#0D0D0D] disabled:opacity-50 transition-colors rounded-none"
-            >
-              {isLocating ? '[SCANNING SATELLITES...]' : '[VERIFY GENESIS LOCATION (GPS)]'}
-            </button>
-            <button
-              type="button"
-              onClick={handleSimulateGps}
-              className="bg-[#0D0D0D] text-[#EAE6DF]/80 border-2 border-[#EAE6DF]/60 px-2.5 py-2.5 text-[11px] font-bold uppercase hover:border-[#EAE6DF] hover:text-[#EAE6DF] transition-colors rounded-none whitespace-nowrap"
-              title="Demo fallback for indoor testing"
-            >
-              [SIMULATE VENUE GPS]
-            </button>
-          </div>
-        </div>
-
-        {/* Step 2B: Scene Passphrase */}
-        <form
-          onSubmit={handlePassphraseSubmit}
-          className="border-t-2 border-[#EAE6DF]/20 pt-4 space-y-3"
-        >
+        {/* Account Clearance Type (Registration Only) */}
+        {authMode === "REGISTER" && (
           <div className="space-y-1.5">
-            <label htmlFor="scene-passphrase" className="block text-xs font-bold uppercase">
-              02B // SCENE PASSPHRASE:
+            <label className="block text-xs font-bold uppercase">
+              00 // ACCOUNT CLEARANCE TYPE:
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setAccountType("OPERATIVE")}
+                className={`border-2 p-2.5 text-left transition-colors rounded-none ${
+                  accountType === "OPERATIVE"
+                    ? "border-[#33FF00] bg-[#33FF00]/15 text-[#33FF00]"
+                    : "border-[#EAE6DF]/40 bg-[#0D0D0D] text-[#EAE6DF]/70 hover:border-[#EAE6DF]"
+                }`}
+              >
+                <div className="text-xs font-bold uppercase">[LISTENER / OPERATIVE]</div>
+                <div className="text-[10px] opacity-80 mt-0.5">
+                  Scan nodes, earn PTS, redeem vouchers
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setAccountType("BAND")}
+                className={`border-2 p-2.5 text-left transition-colors rounded-none ${
+                  accountType === "BAND"
+                    ? "border-[#D9381E] bg-[#D9381E]/20 text-[#EAE6DF]"
+                    : "border-[#EAE6DF]/40 bg-[#0D0D0D] text-[#EAE6DF]/70 hover:border-[#EAE6DF]"
+                }`}
+              >
+                <div className="text-xs font-bold uppercase text-[#D9381E]">
+                  [BAND / COLLECTIVE]
+                </div>
+                <div className="text-[10px] opacity-80 mt-0.5">
+                  Mint gig tickets, merch &amp; market drops
+                </div>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Shared Credentials Inputs */}
+        <div className="space-y-3">
+          <div className="space-y-1">
+            <label htmlFor="operative-handle" className="block text-xs font-bold uppercase">
+              01 // {authMode === "REGISTER" && accountType === "BAND" ? "BAND / COLLECTIVE HANDLE:" : "OPERATIVE HANDLE:"}
             </label>
             <input
-              id="scene-passphrase"
+              id="operative-handle"
               type="text"
-              value={passphrase}
+              value={handleInput}
               onChange={(e) => {
-                setPassphrase(e.target.value);
-                if (statusType === 'error') setStatusMessage(null);
+                setHandleInput(e.target.value);
+                if (statusType === "error") setStatusMessage(null);
               }}
-              placeholder="ENTER FREQUENCY KEY..."
-              autoComplete="off"
-              className="w-full bg-[#0D0D0D] border-2 border-[#EAE6DF] px-3 py-2.5 text-sm text-[#EAE6DF] uppercase placeholder-[#EAE6DF]/35 focus:outline-none focus:border-[#D9381E] rounded-none"
+              placeholder={authMode === "REGISTER" && accountType === "BAND" ? "zgomot_subteran" : "andrei77"}
+              autoComplete="username"
+              className="w-full bg-[#0D0D0D] border-2 border-[#EAE6DF] px-3 py-2.5 text-sm text-[#33FF00] placeholder-[#EAE6DF]/35 focus:outline-none focus:border-[#33FF00] rounded-none"
             />
           </div>
 
-          <button
-            type="submit"
-            className="w-full bg-[#EAE6DF] text-[#0D0D0D] border-2 border-[#EAE6DF] py-2.5 text-xs sm:text-sm font-bold uppercase hover:bg-[#D9381E] hover:text-[#EAE6DF] hover:border-[#D9381E] transition-colors rounded-none"
-          >
-            [ENTER FREQUENCY]
-          </button>
-        </form>
+          <div className="space-y-1">
+            <label htmlFor="operative-password" className="block text-xs font-bold uppercase">
+              02 // PASSWORD (MIN 6 CHARS):
+            </label>
+            <input
+              id="operative-password"
+              type="password"
+              value={passwordInput}
+              onChange={(e) => {
+                setPasswordInput(e.target.value);
+                if (statusType === "error") setStatusMessage(null);
+              }}
+              placeholder="••••••••"
+              autoComplete={authMode === "LOGIN" ? "current-password" : "new-password"}
+              className="w-full bg-[#0D0D0D] border-2 border-[#EAE6DF] px-3 py-2.5 text-sm text-[#EAE6DF] placeholder-[#EAE6DF]/35 focus:outline-none focus:border-[#33FF00] rounded-none"
+            />
+          </div>
+        </div>
+
+        {/* LOGIN VIEW */}
+        {authMode === "LOGIN" ? (
+          <form onSubmit={handleLoginSubmit} className="pt-2">
+            <button
+              type="submit"
+              disabled={isBusy}
+              className="w-full bg-[#EAE6DF] text-[#0D0D0D] border-2 border-[#EAE6DF] py-3 text-xs sm:text-sm font-bold uppercase hover:bg-[#33FF00] hover:border-[#33FF00] disabled:opacity-50 transition-colors rounded-none"
+            >
+              {isBusy ? "[TUNING...]" : "[ENTER FREQUENCY]"}
+            </button>
+          </form>
+        ) : (
+          <div className="space-y-4 border-t-2 border-[#EAE6DF]/20 pt-4">
+            <div className="space-y-2">
+              <div className="flex items-center justify-between text-xs font-bold uppercase">
+                <span>03A // GENESIS LOCATION CHECK</span>
+                <span className="text-[11px] text-[#EAE6DF]/60">TIMIȘOARA</span>
+              </div>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <button
+                  type="button"
+                  disabled={isBusy}
+                  onClick={handleGpsVerification}
+                  className="flex-1 bg-[#0D0D0D] text-[#33FF00] border-2 border-[#33FF00] px-3 py-2.5 text-xs font-bold uppercase hover:bg-[#33FF00] hover:text-[#0D0D0D] disabled:opacity-50 transition-colors rounded-none"
+                >
+                  [VERIFY GPS &amp; REGISTER]
+                </button>
+                <button
+                  type="button"
+                  disabled={isBusy}
+                  onClick={() => void completeAccountCreation("SIMULATED VENUE GPS")}
+                  className="bg-[#0D0D0D] text-[#EAE6DF]/80 border-2 border-[#EAE6DF]/60 px-2.5 py-2.5 text-[11px] font-bold uppercase hover:border-[#EAE6DF] hover:text-[#EAE6DF] disabled:opacity-50 transition-colors rounded-none whitespace-nowrap"
+                >
+                  [SIMULATE VENUE GPS]
+                </button>
+              </div>
+            </div>
+
+            <form
+              onSubmit={handleRegisterPassphrase}
+              className="border-t-2 border-[#EAE6DF]/20 pt-4 space-y-3"
+            >
+              <div className="space-y-1">
+                <label htmlFor="scene-passphrase" className="block text-xs font-bold uppercase">
+                  03B // OR REGISTER WITH SCENE KEY:
+                </label>
+                <input
+                  id="scene-passphrase"
+                  type="text"
+                  value={passphrase}
+                  onChange={(e) => {
+                    setPassphrase(e.target.value);
+                    if (statusType === "error") setStatusMessage(null);
+                  }}
+                  placeholder="MARSHALL77"
+                  autoComplete="off"
+                  className="w-full bg-[#0D0D0D] border-2 border-[#EAE6DF] px-3 py-2.5 text-sm text-[#EAE6DF] uppercase placeholder-[#EAE6DF]/35 focus:outline-none focus:border-[#D9381E] rounded-none"
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={isBusy}
+                className="w-full bg-[#D9381E] text-[#EAE6DF] border-2 border-[#EAE6DF] py-2.5 text-xs sm:text-sm font-bold uppercase hover:bg-[#EAE6DF] hover:text-[#0D0D0D] disabled:opacity-50 transition-colors rounded-none"
+              >
+                {isBusy ? "[REGISTERING...]" : `[CREATE ${accountType} ACCOUNT]`}
+              </button>
+            </form>
+          </div>
+        )}
       </div>
     </div>
   );
