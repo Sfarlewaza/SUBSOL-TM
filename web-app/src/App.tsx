@@ -1,11 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { Landmark, UserState } from './types';
+import { UserState } from './types';
 import { landmarks } from './data/landmarks';
 import { Gatekeeper } from './components/Gatekeeper';
 import { PassAndMarket } from './components/PassAndMarket';
-
 import ScannerView from './components/ScannerView';
 import ArchiveAndQuiz from './components/ArchiveAndQuiz';
+import CommsRoom from './components/CommsRoom';
 
 const STORAGE_KEY = 'frecventa77_state';
 
@@ -17,15 +17,7 @@ const INITIAL_STATE: UserState = {
   quizCompleted: false,
 };
 
-type ActiveTab = 'SCANNER' | 'ARCHIVE' | 'PASS' | 'MARKET';
-
-// ============================================================================
-// TEMPORARY PLACEHOLDER COMPONENTS (Allows immediate zero-error compilation)
-// ============================================================================
-
-// ============================================================================
-// MAIN APPLICATION STATE ENGINE (src/App.tsx)
-// ============================================================================
+type ActiveTab = 'SCANNER' | 'ARCHIVE' | 'COMMS' | 'PASS' | 'MARKET';
 
 export function App() {
   const [state, setState] = useState<UserState>(() => {
@@ -108,10 +100,11 @@ export function App() {
   }
 
   const navItems: { id: ActiveTab; label: string }[] = [
-    { id: 'SCANNER', label: '[SCANNER]' },
-    { id: 'ARCHIVE', label: '[ARCHIVE]' },
-    { id: 'PASS', label: '[PASS]' },
-    { id: 'MARKET', label: '[BLACK MARKET]' },
+    { id: 'SCANNER', label: 'SCAN' },
+    { id: 'ARCHIVE', label: 'FILES' },
+    { id: 'COMMS', label: 'COMMS' },
+    { id: 'PASS', label: 'PASS' },
+    { id: 'MARKET', label: 'MARKET' },
   ];
 
   return (
@@ -156,6 +149,10 @@ export function App() {
           />
         )}
 
+        {activeTab === 'COMMS' && (
+          <CommsRoom handle={state.handle} points={state.points} />
+        )}
+
         {activeTab === 'PASS' && (
           <PassAndMarket
             mode="PASS"
@@ -189,7 +186,7 @@ export function App() {
 
       {/* Fixed Bottom Navigation Bar */}
       <nav className="fixed bottom-0 left-0 right-0 bg-[#0D0D0D] border-t-2 border-[#EAE6DF] z-30">
-        <div className="max-w-xl mx-auto grid grid-cols-4">
+        <div className="max-w-xl mx-auto grid grid-cols-5">
           {navItems.map((item, idx) => {
             const isActive = activeTab === item.id;
             return (
@@ -197,7 +194,7 @@ export function App() {
                 key={item.id}
                 type="button"
                 onClick={() => setActiveTab(item.id)}
-                className={`py-3.5 px-1 text-[11px] sm:text-xs font-bold uppercase tracking-tight transition-colors rounded-none ${
+                className={`py-3.5 px-1 text-[10px] sm:text-xs font-bold uppercase tracking-tight transition-colors rounded-none ${
                   idx < navItems.length - 1 ? 'border-r-2 border-[#EAE6DF]' : ''
                 } ${
                   isActive
@@ -205,7 +202,7 @@ export function App() {
                     : 'bg-[#0D0D0D] text-[#EAE6DF] hover:bg-[#EAE6DF] hover:text-[#0D0D0D]'
                 }`}
               >
-                {item.label}
+                [{item.label}]
               </button>
             );
           })}
