@@ -24,7 +24,6 @@ export const supabase = createClient(
 
 export const WHITELISTED_ADMINS = ['sfarleaza', 'admin', 'frecventa77', 'curator'];
 
-
 const KNOWN_BAND_HANDLES_KEY = 'frecventa77_band_handles_v1';
 
 export function rememberBandHandle(handle: string): void {
@@ -71,6 +70,18 @@ function handleToEmail(handle: string): string {
   return `${clean || 'operative'}@frecventa77.local`;
 }
 
+async function hashPassphrase(raw: string): Promise<string> {
+  try {
+    const data = new TextEncoder().encode(`f77:${raw.trim()}`);
+    const digest = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  } catch {
+    return btoa(unescape(encodeURIComponent(`f77:${raw.trim()}`)));
+  }
+}
+
 function buildLocalFallbackProfile(
   cleanHandle: string,
   accountType: AccountType = 'OPERATIVE'
@@ -80,7 +91,6 @@ function buildLocalFallbackProfile(
     ? 'ADMIN'
     : accountType;
 
-  // Check if a saved state already exists in localStorage for this handle
   try {
     const savedState = JSON.parse(localStorage.getItem('frecventa77_state') || 'null');
     if (savedState && savedState.handle?.toLowerCase() === cleanHandle.toLowerCase()) {
@@ -147,23 +157,54 @@ export async function registerOperative(
   }
 
   try {
+    const passHash = await hashPassphrase(passphrase);
     const email = handleToEmail(cleanHandle);
+
+    // Check if handle already exists in Supabase profiles
+    const { data: existingByHandle } = await supabase
+      .from('profiles')
+      .select('*')
+      .ilike('handle', cleanHandle)
+      .limit(1)
+      .maybeSingle();
+
+    if (existingByHandle) {
+      if (existingByHandle.passphrase_hash && existingByHandle.passphrase_hash !== passHash) {
+        throw new Error('Handle already registered with a different passphrase.');
+      }
+      const restoredRole: AccountType = isWhitelistedAdminHandle(cleanHandle)
+        ? 'ADMIN'
+        : (existingByHandle.account_type as AccountType) || effectiveRole;
+      if (restoredRole === 'BAND') rememberBandHandle(cleanHandle);
+
+      const profile: ProfileRecord = {
+        id: existingByHandle.id,
+        handle: existingByHandle.handle,
+        account_type: restoredRole,
+        points: Math.max(100, existingByHandle.points ?? 100),
+        unlocked_ids:
+          existingByHandle.unlocked_ids?.length > 0
+            ? existingByHandle.unlocked_ids
+            : ['sfintii-62'],
+        quiz_completed: Boolean(existingByHandle.quiz_completed),
+      };
+      localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify(profile));
+      return profile;
+    }
+
     const { data, error } = await supabase.auth.signUp({
       email,
       password: passphrase,
     });
 
-    let user = data?.user ?? null;
-    if (error || !user) {
+    let userId = data?.user?.id ?? null;
+    if (error || !userId) {
       const anon = await supabase.auth.signInAnonymously();
-      if (anon.error || !anon.data.user) {
-        return buildLocalFallbackProfile(cleanHandle, effectiveRole);
-      }
-      user = anon.data.user;
+      userId = anon.data?.user?.id ?? crypto.randomUUID();
     }
 
     const starterProfile: ProfileRecord = {
-      id: user.id,
+      id: userId,
       handle: cleanHandle,
       account_type: effectiveRole,
       points: 100,
@@ -171,19 +212,30 @@ export async function registerOperative(
       quiz_completed: false,
     };
 
-    await supabase.from('profiles').upsert({
-      id: starterProfile.id,
-      handle: starterProfile.handle,
-      account_type: starterProfile.account_type,
-      points: starterProfile.points,
-      unlocked_ids: starterProfile.unlocked_ids,
-      quiz_completed: starterProfile.quiz_completed,
-    });
+    const { error: upsertErr } = await supabase.from('profiles').upsert(
+      {
+        id: starterProfile.id,
+        handle: starterProfile.handle,
+        passphrase_hash: passHash,
+        account_type: starterProfile.account_type,
+        points: starterProfile.points,
+        unlocked_ids: starterProfile.unlocked_ids,
+        quiz_completed: starterProfile.quiz_completed,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'handle' }
+    );
+
+    if (upsertErr) {
+      console.error('Supabase profile register upsert error:', upsertErr.message);
+    }
 
     localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify(starterProfile));
     return starterProfile;
-  } catch {
-    // Graceful offline / network-unreachable fallback so login never fails with NetworkError
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('already registered')) {
+      throw err;
+    }
     return buildLocalFallbackProfile(cleanHandle, effectiveRole);
   }
 }
@@ -198,40 +250,39 @@ export async function loginOperative(
   }
 
   if (!HAS_REAL_SUPABASE) {
-    return buildLocalFallbackProfile(cleanHandle, 'OPERATIVE');
+    return buildLocalFallbackProfile(
+      cleanHandle,
+      isKnownBandHandle(cleanHandle) ? 'BAND' : 'OPERATIVE'
+    );
   }
 
   try {
+    const passHash = await hashPassphrase(passphrase);
     const email = handleToEmail(cleanHandle);
-    const { data, error } = await supabase.auth.signInWithPassword({
+
+    // Try standard email/password auth first
+    const { data } = await supabase.auth.signInWithPassword({
       email,
       password: passphrase,
     });
 
-    let user = data?.user ?? null;
-    if (error || !user) {
-      const anon = await supabase.auth.signInAnonymously();
-      if (anon.error || !anon.data.user) {
-        return buildLocalFallbackProfile(cleanHandle, 'OPERATIVE');
-      }
-      user = anon.data.user;
-    }
-
-    let { data: existing } = await supabase
+    // Always look up the canonical profile row by handle so cross-device logins find the exact account & role
+    const { data: existing } = await supabase
       .from('profiles')
       .select('*')
-      .eq('id', user.id)
+      .ilike('handle', cleanHandle)
+      .order('updated_at', { ascending: false })
+      .limit(1)
       .maybeSingle();
 
-    if (!existing) {
-      const byHandle = await supabase
-        .from('profiles')
-        .select('*')
-        .ilike('handle', cleanHandle)
-        .order('points', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      existing = byHandle.data;
+    if (existing?.passphrase_hash && existing.passphrase_hash !== passHash) {
+      throw new Error('Invalid passphrase for this handle.');
+    }
+
+    let profileId = existing?.id || data?.user?.id || null;
+    if (!profileId) {
+      const anon = await supabase.auth.signInAnonymously();
+      profileId = anon.data?.user?.id ?? crypto.randomUUID();
     }
 
     const resolvedRole: AccountType = isWhitelistedAdminHandle(cleanHandle)
@@ -242,7 +293,7 @@ export async function loginOperative(
     if (resolvedRole === 'BAND') rememberBandHandle(cleanHandle);
 
     const profile: ProfileRecord = {
-      id: user.id,
+      id: profileId,
       handle: existing?.handle || cleanHandle,
       account_type: resolvedRole,
       points: Math.max(100, existing?.points ?? 100),
@@ -253,61 +304,124 @@ export async function loginOperative(
       quiz_completed: Boolean(existing?.quiz_completed),
     };
 
-    await supabase.from('profiles').upsert({
-      id: profile.id,
-      handle: profile.handle,
-      account_type: profile.account_type,
-      points: profile.points,
-      unlocked_ids: profile.unlocked_ids,
-      quiz_completed: profile.quiz_completed,
-    });
+    await supabase.from('profiles').upsert(
+      {
+        id: profile.id,
+        handle: profile.handle,
+        passphrase_hash: existing?.passphrase_hash || passHash,
+        account_type: profile.account_type,
+        points: profile.points,
+        unlocked_ids: profile.unlocked_ids,
+        quiz_completed: profile.quiz_completed,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'handle' }
+    );
 
     localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify(profile));
     return profile;
-  } catch {
-    // Graceful offline / network-unreachable fallback so login never fails with NetworkError
-    return buildLocalFallbackProfile(cleanHandle, 'OPERATIVE');
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('Invalid passphrase')) {
+      throw err;
+    }
+    return buildLocalFallbackProfile(
+      cleanHandle,
+      isKnownBandHandle(cleanHandle) ? 'BAND' : 'OPERATIVE'
+    );
   }
 }
 
-export async function burnOperativeAccount(): Promise<void> {
+export async function burnOperativeAccount(rawHandle?: string): Promise<void> {
+  const localRaw = localStorage.getItem(LOCAL_SESSION_KEY);
   localStorage.removeItem(LOCAL_SESSION_KEY);
+  localStorage.removeItem('frecventa77_state');
+
+  let targetHandle = rawHandle;
+  if (!targetHandle && localRaw) {
+    try {
+      const parsed = JSON.parse(localRaw);
+      targetHandle = parsed?.handle;
+    } catch {
+      // ignore
+    }
+  }
+
   if (!HAS_REAL_SUPABASE) return;
   try {
-    const { data } = await supabase.auth.getUser();
-    if (data.user) {
-      await supabase.from('profiles').delete().eq('id', data.user.id);
+    if (targetHandle) {
+      const clean = targetHandle.trim().replace(/^@/, '');
+      await supabase.from('profiles').delete().ilike('handle', clean);
+    }
+    const { data: authUser } = await supabase.auth.getUser();
+    if (authUser.user) {
+      await supabase.from('profiles').delete().eq('id', authUser.user.id);
     }
     await supabase.auth.signOut();
-  } catch {
-    // ignore network error on account burn
+  } catch (err) {
+    console.error('Error burning account on Supabase:', err);
   }
 }
 
 export async function loadActiveSessionProfile(): Promise<ProfileRecord | null> {
-  if (!HAS_REAL_SUPABASE) {
-    try {
-      const local = JSON.parse(localStorage.getItem(LOCAL_SESSION_KEY) || 'null');
-      if (local && local.handle) {
-        return {
-          ...local,
-          account_type: isWhitelistedAdminHandle(local.handle)
-            ? 'ADMIN'
-            : local.account_type || (isKnownBandHandle(local.handle) ? 'BAND' : 'OPERATIVE'),
-        };
-      }
-    } catch {
-      return null;
+  let localProfile: ProfileRecord | null = null;
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LOCAL_SESSION_KEY) || 'null');
+    if (parsed && parsed.handle) {
+      localProfile = parsed;
     }
-    return null;
+  } catch {
+    localProfile = null;
+  }
+
+  if (!HAS_REAL_SUPABASE) {
+    if (!localProfile) return null;
+    return {
+      ...localProfile,
+      account_type: isWhitelistedAdminHandle(localProfile.handle)
+        ? 'ADMIN'
+        : localProfile.account_type ||
+          (isKnownBandHandle(localProfile.handle) ? 'BAND' : 'OPERATIVE'),
+    };
   }
 
   try {
-    const { data } = await supabase.auth.getUser();
-    if (!data.user) {
-      const local = JSON.parse(localStorage.getItem(LOCAL_SESSION_KEY) || 'null');
-      return local && local.handle ? local : null;
+    // Prefer refreshing the locally stored handle from Supabase so cross-device updates (points, BAND role) sync on reload
+    if (localProfile?.handle) {
+      const { data: remoteByHandle } = await supabase
+        .from('profiles')
+        .select('*')
+        .ilike('handle', localProfile.handle)
+        .limit(1)
+        .maybeSingle();
+
+      if (remoteByHandle) {
+        const effectiveType: AccountType = isWhitelistedAdminHandle(remoteByHandle.handle)
+          ? 'ADMIN'
+          : (remoteByHandle.account_type as AccountType) ||
+            localProfile.account_type ||
+            (isKnownBandHandle(remoteByHandle.handle) ? 'BAND' : 'OPERATIVE');
+
+        if (effectiveType === 'BAND') rememberBandHandle(remoteByHandle.handle);
+
+        const merged: ProfileRecord = {
+          id: remoteByHandle.id,
+          handle: remoteByHandle.handle,
+          account_type: effectiveType,
+          points: Math.max(100, remoteByHandle.points ?? localProfile.points ?? 100),
+          unlocked_ids:
+            remoteByHandle.unlocked_ids?.length > 0
+              ? remoteByHandle.unlocked_ids
+              : localProfile.unlocked_ids || ['sfintii-62'],
+          quiz_completed: Boolean(remoteByHandle.quiz_completed || localProfile.quiz_completed),
+        };
+        localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify(merged));
+        return merged;
+      }
+      return localProfile;
     }
+
+    const { data } = await supabase.auth.getUser();
+    if (!data.user) return null;
 
     const { data: profile } = await supabase
       .from('profiles')
@@ -315,16 +429,16 @@ export async function loadActiveSessionProfile(): Promise<ProfileRecord | null> 
       .eq('id', data.user.id)
       .maybeSingle();
 
-    if (!profile) {
-      const local = JSON.parse(localStorage.getItem(LOCAL_SESSION_KEY) || 'null');
-      return local && local.handle ? local : null;
-    }
+    if (!profile) return null;
 
     const effectiveType: AccountType = isWhitelistedAdminHandle(profile.handle)
       ? 'ADMIN'
-      : (profile.account_type as AccountType) || (isKnownBandHandle(profile.handle) ? 'BAND' : 'OPERATIVE');
+      : (profile.account_type as AccountType) ||
+        (isKnownBandHandle(profile.handle) ? 'BAND' : 'OPERATIVE');
 
-    return {
+    if (effectiveType === 'BAND') rememberBandHandle(profile.handle);
+
+    const hydrated: ProfileRecord = {
       id: profile.id,
       handle: profile.handle,
       account_type: effectiveType,
@@ -335,13 +449,10 @@ export async function loadActiveSessionProfile(): Promise<ProfileRecord | null> 
           : ['sfintii-62'],
       quiz_completed: Boolean(profile.quiz_completed),
     };
+    localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify(hydrated));
+    return hydrated;
   } catch {
-    try {
-      const local = JSON.parse(localStorage.getItem(LOCAL_SESSION_KEY) || 'null');
-      return local && local.handle ? local : null;
-    } catch {
-      return null;
-    }
+    return localProfile;
   }
 }
 
@@ -351,11 +462,16 @@ export async function syncProfileState(state: UserState): Promise<void> {
     ? 'ADMIN'
     : state.accountType;
 
+  if (effectiveType === 'BAND') rememberBandHandle(state.handle);
+
+  let existingId = `local-${state.handle.toLowerCase()}`;
   try {
+    const prevLocal = JSON.parse(localStorage.getItem(LOCAL_SESSION_KEY) || 'null');
+    if (prevLocal?.id) existingId = prevLocal.id;
     localStorage.setItem(
       LOCAL_SESSION_KEY,
       JSON.stringify({
-        id: `local-${state.handle.toLowerCase()}`,
+        id: existingId,
         handle: state.handle,
         account_type: effectiveType,
         points: state.points,
@@ -370,17 +486,19 @@ export async function syncProfileState(state: UserState): Promise<void> {
   if (!HAS_REAL_SUPABASE) return;
 
   try {
-    const { data } = await supabase.auth.getUser();
-    if (!data.user) return;
-
-    await supabase.from('profiles').upsert({
-      id: data.user.id,
-      handle: state.handle,
-      account_type: effectiveType,
-      points: state.points,
-      unlocked_ids: state.unlockedIds,
-      quiz_completed: state.quizCompleted,
-    });
+    const rowId = existingId.startsWith('local-') ? crypto.randomUUID() : existingId;
+    await supabase.from('profiles').upsert(
+      {
+        id: rowId,
+        handle: state.handle,
+        account_type: effectiveType,
+        points: state.points,
+        unlocked_ids: state.unlockedIds,
+        quiz_completed: state.quizCompleted,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'handle' }
+    );
   } catch {
     // silently ignore network issues during background sync
   }
@@ -396,11 +514,116 @@ export async function logoutOperative(): Promise<void> {
   }
 }
 
-// Local + Shared Custom Registry Keys (Admin & Band Created Content)
+// ============================================================================
+// SHARED CUSTOM REGISTRIES (Local Cache + Real-Time Supabase Table Sync)
+// ============================================================================
 const CUSTOM_QUIZZES_KEY = 'frecventa77_custom_quizzes_v1';
 const CUSTOM_LANDMARKS_KEY = 'frecventa77_custom_landmarks_v1';
 const CUSTOM_MARKET_KEY = 'frecventa77_custom_market_v1';
 const CUSTOM_DUTIES_KEY = 'frecventa77_custom_duties_v1';
+
+async function pushRegistryToSupabase<T extends { id: string }>(
+  table: string,
+  items: T[],
+  mapExtra?: (item: T) => Record<string, unknown>
+): Promise<void> {
+  if (!HAS_REAL_SUPABASE) return;
+  try {
+    if (items.length > 0) {
+      const rows = items.map((item) => ({
+        id: item.id,
+        payload: item,
+        updated_at: new Date().toISOString(),
+        ...(mapExtra ? mapExtra(item) : {}),
+      }));
+      const { error } = await supabase.from(table).upsert(rows, { onConflict: 'id' });
+      if (error) console.error(`Supabase upsert failed on ${table}:`, error.message);
+    }
+
+    // Remove any rows deleted in Admin/Band console
+    const { data: existingRows } = await supabase.from(table).select('id');
+    if (Array.isArray(existingRows)) {
+      const keepIds = new Set(items.map((i) => i.id));
+      const toDelete = existingRows.map((r) => r.id).filter((id) => !keepIds.has(id));
+      if (toDelete.length > 0) {
+        await supabase.from(table).delete().in('id', toDelete);
+      }
+    }
+  } catch (err) {
+    console.error(`Supabase sync exception on ${table}:`, err);
+  }
+}
+
+export async function hydrateSharedRegistriesFromSupabase(): Promise<boolean> {
+  if (!HAS_REAL_SUPABASE) return false;
+  try {
+    const [lmRes, dutyRes, mktRes, quizRes] = await Promise.all([
+      supabase.from('custom_landmarks').select('payload').order('updated_at', { ascending: false }),
+      supabase.from('custom_duties').select('payload').order('updated_at', { ascending: false }),
+      supabase.from('custom_market_items').select('payload').order('updated_at', { ascending: false }),
+      supabase.from('custom_quizzes').select('payload').order('updated_at', { ascending: false }),
+    ]);
+
+    if (Array.isArray(lmRes.data)) {
+      const remoteLandmarks = lmRes.data.map((r) => r.payload as Landmark).filter(Boolean);
+      const localLandmarks = getCustomLandmarks();
+      const remoteIds = new Set(remoteLandmarks.map((l) => l.id));
+      // Also push any local-only landmarks that haven't reached Supabase yet
+      const unsyncedLocal = localLandmarks.filter((l) => !remoteIds.has(l.id));
+      const merged = [...unsyncedLocal, ...remoteLandmarks];
+      localStorage.setItem(CUSTOM_LANDMARKS_KEY, JSON.stringify(merged));
+      if (unsyncedLocal.length > 0) {
+        void pushRegistryToSupabase('custom_landmarks', merged, (item) => ({
+          created_by_type: item.createdByType || 'BAND',
+          creator_handle: item.band || null,
+        }));
+      }
+    }
+
+    if (Array.isArray(dutyRes.data)) {
+      const remoteDuties = dutyRes.data.map((r) => r.payload as CommunityDuty).filter(Boolean);
+      const localDuties = getCustomDuties();
+      const remoteIds = new Set(remoteDuties.map((d) => d.id));
+      const unsyncedLocal = localDuties.filter((d) => !remoteIds.has(d.id));
+      const merged = [...unsyncedLocal, ...remoteDuties];
+      localStorage.setItem(CUSTOM_DUTIES_KEY, JSON.stringify(merged));
+      if (unsyncedLocal.length > 0) {
+        void pushRegistryToSupabase('custom_duties', merged, (item) => ({
+          creator_handle: item.bandOrVenue || null,
+        }));
+      }
+    }
+
+    if (Array.isArray(mktRes.data)) {
+      const remoteMarket = mktRes.data.map((r) => r.payload as MarketItem).filter(Boolean);
+      const localMarket = getCustomMarketItems();
+      const remoteIds = new Set(remoteMarket.map((m) => m.id));
+      const unsyncedLocal = localMarket.filter((m) => !remoteIds.has(m.id));
+      const merged = [...unsyncedLocal, ...remoteMarket];
+      localStorage.setItem(CUSTOM_MARKET_KEY, JSON.stringify(merged));
+      if (unsyncedLocal.length > 0) {
+        void pushRegistryToSupabase('custom_market_items', merged);
+      }
+    }
+
+    if (Array.isArray(quizRes.data)) {
+      const remoteQuizzes = quizRes.data.map((r) => r.payload as QuizNode).filter(Boolean);
+      const localQuizzes = getCustomQuizzes();
+      const remoteIds = new Set(remoteQuizzes.map((q) => q.id));
+      const unsyncedLocal = localQuizzes.filter((q) => !remoteIds.has(q.id));
+      const merged = [...unsyncedLocal, ...remoteQuizzes];
+      localStorage.setItem(CUSTOM_QUIZZES_KEY, JSON.stringify(merged));
+      if (unsyncedLocal.length > 0) {
+        void pushRegistryToSupabase('custom_quizzes', merged);
+      }
+    }
+
+    return true;
+  } catch (err) {
+    console.error('Failed to hydrate shared registries from Supabase:', err);
+    return false;
+  }
+}
 
 export function getCustomQuizzes(): QuizNode[] {
   try {
@@ -412,6 +635,7 @@ export function getCustomQuizzes(): QuizNode[] {
 
 export function saveCustomQuizzes(items: QuizNode[]): void {
   localStorage.setItem(CUSTOM_QUIZZES_KEY, JSON.stringify(items));
+  void pushRegistryToSupabase('custom_quizzes', items);
 }
 
 export function getCustomLandmarks(): Landmark[] {
@@ -424,6 +648,10 @@ export function getCustomLandmarks(): Landmark[] {
 
 export function saveCustomLandmarks(items: Landmark[]): void {
   localStorage.setItem(CUSTOM_LANDMARKS_KEY, JSON.stringify(items));
+  void pushRegistryToSupabase('custom_landmarks', items, (item) => ({
+    created_by_type: item.createdByType || 'BAND',
+    creator_handle: item.band || null,
+  }));
 }
 
 export function getCustomMarketItems(): MarketItem[] {
@@ -436,6 +664,7 @@ export function getCustomMarketItems(): MarketItem[] {
 
 export function saveCustomMarketItems(items: MarketItem[]): void {
   localStorage.setItem(CUSTOM_MARKET_KEY, JSON.stringify(items));
+  void pushRegistryToSupabase('custom_market_items', items);
 }
 
 export function getCustomDuties(): CommunityDuty[] {
@@ -448,4 +677,7 @@ export function getCustomDuties(): CommunityDuty[] {
 
 export function saveCustomDuties(items: CommunityDuty[]): void {
   localStorage.setItem(CUSTOM_DUTIES_KEY, JSON.stringify(items));
+  void pushRegistryToSupabase('custom_duties', items, (item) => ({
+    creator_handle: item.bandOrVenue || null,
+  }));
 }

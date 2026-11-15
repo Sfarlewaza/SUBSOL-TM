@@ -23,6 +23,7 @@ import {
 } from '../utils/supabaseClient';
 import {
   computeFastDHash,
+  cropFileToSquareDataUrl,
   loadScannerSandbox,
   saveScannerSandbox,
   ScannerSandboxConfig,
@@ -124,51 +125,33 @@ export default function AdminConsole({
     });
   }
 
-  function handleSandboxRefUpload(e: React.ChangeEvent<HTMLInputElement>) {
+  async function handleSandboxRefUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      const scale = Math.min(1, 320 / Math.max(img.width, img.height));
-      canvas.width = Math.round(img.width * scale);
-      canvas.height = Math.round(img.height * scale);
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        updateSandbox({
-          refImageDataUrl: canvas.toDataURL('image/jpeg', 0.7),
-          enabled: true,
-        });
-        flash('✓ CUSTOM SCANNER REFERENCE LOADED INTO ADMIN TEST TOKEN.');
-      }
-      URL.revokeObjectURL(url);
-    };
-    img.src = url;
+    const { dataUrl, wasCropped } = await cropFileToSquareDataUrl(file, 360, 0.78);
+    if (!dataUrl) return;
+    updateSandbox({
+      refImageDataUrl: dataUrl,
+      enabled: true,
+    });
+    flash(
+      wasCropped
+        ? '✓ AUTO-CROPPED TO CENTER 1:1 SQUARE & LOADED INTO ADMIN TEST TOKEN.'
+        : '✓ 1:1 SQUARE REFERENCE LOADED INTO ADMIN TEST TOKEN.'
+    );
   }
 
   async function handleLandmarkPhotoUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
-    const dHash = await computeFastDHash(file);
+    const { dataUrl, wasCropped } = await cropFileToSquareDataUrl(file, 360, 0.78);
+    if (!dataUrl) return;
+    const dHash = await computeFastDHash(dataUrl);
     setLmRefHash(dHash);
-
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      const scale = Math.min(1, 320 / Math.max(img.width, img.height));
-      canvas.width = Math.round(img.width * scale);
-      canvas.height = Math.round(img.height * scale);
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        setLmRefImage(canvas.toDataURL('image/jpeg', 0.65));
-      }
-      URL.revokeObjectURL(url);
-    };
-    img.src = url;
+    setLmRefImage(dataUrl);
+    if (wasCropped) {
+      flash('⚠ NON-SQUARE PHOTO AUTO-CROPPED TO CENTER 1:1 SQUARE FOR SCANNER PARITY.');
+    }
   }
 
   function handleAddLandmark(e: React.FormEvent) {
@@ -489,24 +472,31 @@ export default function AdminConsole({
                 </button>
               </div>
 
-              <div className="flex items-center justify-between gap-2 pt-1">
-                <span className="text-[10px] text-[#33FF00]">
-                  {sandbox.refImageDataUrl ? '✓ REFERENCE PICTURE LOADED' : 'OR UPLOAD CUSTOM PHOTO:'}
-                </span>
-                <input
-                  type="file"
-                  accept="image/*"
-                  onChange={handleSandboxRefUpload}
-                  className="text-[10px] text-[#EAE6DF]"
-                />
+              <div className="space-y-1.5 pt-1">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] text-[#33FF00]">
+                    {sandbox.refImageDataUrl ? '✓ 1:1 REFERENCE PICTURE LOADED' : 'OR UPLOAD CUSTOM PHOTO:'}
+                  </span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={handleSandboxRefUpload}
+                    className="text-[10px] text-[#EAE6DF]"
+                  />
+                </div>
+                <div className="text-[9px] text-amber-300/90">
+                  ⚠ 1:1 SQUARE ASPECT RATIO REQUIRED — NON-SQUARE PHOTOS ARE AUTO-CROPPED TO CENTER 1:1.
+                </div>
               </div>
 
               {sandbox.refImageDataUrl && (
-                <img
-                  src={sandbox.refImageDataUrl}
-                  alt="Calibration preview"
-                  className="mt-2 h-28 w-full object-cover border border-[#33FF00]/60 grayscale contrast-125"
-                />
+                <div className="mt-2 mx-auto aspect-square w-32 border border-[#33FF00]/60 bg-black overflow-hidden">
+                  <img
+                    src={sandbox.refImageDataUrl}
+                    alt="1:1 Calibration preview"
+                    className="h-full w-full object-cover"
+                  />
+                </div>
               )}
             </div>
           </div>
@@ -588,16 +578,26 @@ export default function AdminConsole({
                 onChange={(e) => setLmStory(e.target.value)}
                 className="w-full border border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
               />
-              <div className="flex items-center justify-between gap-2 border border-[#EAE6DF]/40 bg-black p-2 text-xs">
-                <span className="text-[10px] uppercase text-[#EAE6DF]/80">
-                  {lmRefImage ? '✓ REFERENCE PHOTO + DHASH READY' : 'UPLOAD TARGET PHOTO:'}
-                </span>
-                <input
-                  type="file"
-                  accept="image/*"
-                  onChange={handleLandmarkPhotoUpload}
-                  className="text-[10px] text-[#33FF00]"
-                />
+              <div className="border border-[#EAE6DF]/40 bg-black p-2 text-xs space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] uppercase text-[#EAE6DF]/80">
+                    {lmRefImage ? '✓ 1:1 TARGET PHOTO + 256-BIT DHASH READY' : 'UPLOAD TARGET PHOTO:'}
+                  </span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={handleLandmarkPhotoUpload}
+                    className="text-[10px] text-[#33FF00]"
+                  />
+                </div>
+                <div className="text-[9px] text-amber-300/90">
+                  ⚠ USE A 1:1 SQUARE PHOTO — NON-SQUARE UPLOADS ARE AUTO-CROPPED TO CENTER 1:1 TO MATCH THE LIVE SCANNER.
+                </div>
+                {lmRefImage && (
+                  <div className="mx-auto aspect-square w-28 border border-[#33FF00]/70 overflow-hidden">
+                    <img src={lmRefImage} alt="1:1 node preview" className="h-full w-full object-cover" />
+                  </div>
+                )}
               </div>
               <button
                 type="submit"

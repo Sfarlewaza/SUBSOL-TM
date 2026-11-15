@@ -9,6 +9,7 @@ import CommsRoom from './components/CommsRoom';
 import AdminConsole from './components/AdminConsole';
 import {
   getCustomLandmarks,
+  hydrateSharedRegistriesFromSupabase,
   isKnownBandHandle,
   isWhitelistedAdminHandle,
   loadActiveSessionProfile,
@@ -73,6 +74,16 @@ export function App() {
     isKnownBandHandle(state.handle || '');
 
   const mergedLandmarks = React.useMemo(() => [...getCustomLandmarks(), ...baseLandmarks], [contentVersion]);
+
+  useEffect(() => {
+    let active = true;
+    hydrateSharedRegistriesFromSupabase().then((updated) => {
+      if (active && updated) setContentVersion((v) => v + 1);
+    });
+    return () => {
+      active = false;
+    };
+  }, [activeTab]);
 
   useEffect(() => {
     let active = true;

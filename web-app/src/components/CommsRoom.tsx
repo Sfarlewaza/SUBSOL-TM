@@ -387,12 +387,17 @@ export default function CommsRoom({
     setShowPreview(false);
 
     if (HAS_REAL_SUPABASE) {
-      await supabase.from('forum_messages').insert({
+      await supabase.from('forum_messages').upsert({
+        id: msg.id,
         room_id: msg.room_id,
         sender_handle: msg.sender_handle,
         sender_role: msg.sender_role,
-        content: msg.headline ? `# ${msg.headline}\n${msg.content}` : msg.content,
-      });
+        headline: msg.headline || null,
+        genre_tag: msg.genre_tag || null,
+        photos: msg.photos || null,
+        content: msg.content,
+        created_at: msg.created_at,
+      }, { onConflict: 'id' });
     }
   }
 

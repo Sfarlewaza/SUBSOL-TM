@@ -1,9 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AccountType, Landmark } from '../types';
 import {
-  computeFastDHash,
-  hammingDistance,
+  computeDetailedDHash,
+  computeReferenceHashBank,
+  getScaledMaxDistance,
   loadScannerSandbox,
+  minBankHammingDistance,
 } from '../utils/scannerHash';
 
 interface ScannerViewProps {
@@ -23,12 +25,13 @@ function getLightweightRefUrl(spot: Landmark, usePublicRefs: boolean): string {
   if (usePublicRefs && LOCAL_TEST_REFS[spot.id]) {
     return LOCAL_TEST_REFS[spot.id];
   }
-  const url = spot.referenceImageUrl || '';
-  if (!url) return '';
-  if (url.includes('images.unsplash.com')) {
-    return url.replace(/w=\d+/, 'w=420').replace(/q=\d+/, 'q=65');
+  if (
+    LOCAL_TEST_REFS[spot.id] &&
+    (!spot.referenceImageUrl || spot.referenceImageUrl.includes('unsplash.com'))
+  ) {
+    return LOCAL_TEST_REFS[spot.id];
   }
-  return url;
+  return spot.referenceImageUrl || '';
 }
 
 export default function ScannerView({
@@ -48,7 +51,7 @@ export default function ScannerView({
         band: 'ROOT CALIBRATION',
         era: '2026 // SANDBOX',
         locationName: 'Admin Field Test / Live Pitch Table',
-        riddle: `Aim live viewfinder at your reference marker (${sandbox.refLabel}) to verify Hamming distance <= ${sandbox.maxHammingDistance} bits.`,
+        riddle: `Fit the entire square reference marker (${sandbox.refLabel}) inside the 1:1 square viewfinder.`,
         story: 'Admin perceptual dHash calibration node.',
         points: 150,
         referenceImageUrl: sandbox.refImageDataUrl,
@@ -65,20 +68,25 @@ export default function ScannerView({
     adminTestLandmark ? adminTestLandmark.id : landmarks[0]?.id || 'sfintii-62'
   );
 
-  // Lightweight live camera state (anti-counterfeit: live sensor feed only, no static gallery upload)
+  // True 1:1 square live camera state
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [zoom, setZoom] = useState<number>(1);
-  const [hardwareZoomRange, setHardwareZoomRange] = useState<{ min: number; max: number; step: number } | null>(null);
+  const [hardwareZoomRange, setHardwareZoomRange] = useState<{
+    min: number;
+    max: number;
+    step: number;
+  } | null>(null);
   const [liveSimilarity, setLiveSimilarity] = useState<number | null>(null);
-  const [liveDistance, setLiveDistance] = useState<number | null>(null);
+  const [stableStreak, setStableStreak] = useState<number>(0);
   const [verifying, setVerifying] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const refHashCacheRef = useRef<Record<string, string>>({});
+  const refBankCacheRef = useRef<Record<string, string[]>>({});
+  const streakRef = useRef<number>(0);
 
   const visibleLandmarks = allLandmarks.filter((s) =>
     scanCreatorFilter === 'ALL' ? true : (s.createdByType || 'ADMIN') === scanCreatorFilter
@@ -102,9 +110,10 @@ export default function ScannerView({
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
+    streakRef.current = 0;
+    setStableStreak(0);
     setCameraActive(false);
     setLiveSimilarity(null);
-    setLiveDistance(null);
   }, []);
 
   const startCamera = useCallback(async () => {
@@ -115,8 +124,9 @@ export default function ScannerView({
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: { ideal: 'environment' },
+          aspectRatio: { ideal: 1 },
           width: { ideal: 640 },
-          height: { ideal: 480 },
+          height: { ideal: 640 },
         },
         audio: false,
       });
@@ -157,7 +167,6 @@ export default function ScannerView({
     return () => stopCamera();
   }, [stopCamera]);
 
-  // Apply hardware zoom when supported; digital CSS + ROI crop handles fallback smoothly
   const handleZoomChange = useCallback(
     async (nextZoom: number) => {
       const clamped = Math.max(1, Math.min(4, Number(nextZoom.toFixed(1))));
@@ -173,15 +182,15 @@ export default function ScannerView({
             advanced: [{ zoom: hwVal } as MediaTrackConstraintSet],
           });
         } catch {
-          // Digital zoom fallback stays active seamlessly
+          // Digital zoom fallback stays active
         }
       }
     },
     [hardwareZoomRange]
   );
 
-  // Capture a lightweight 160x160 zoomed center ROI from the live video stream
-  const captureLiveRoiCanvas = useCallback((): HTMLCanvasElement | null => {
+  // Extracts the exact 1:1 square matching the square viewfinder box
+  const captureLiveSquareCanvas = useCallback((): HTMLCanvasElement | null => {
     const video = videoRef.current;
     if (!video || video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
       return null;
@@ -207,58 +216,71 @@ export default function ScannerView({
     return canvas;
   }, [hardwareZoomRange, zoom]);
 
-  const getCachedReferenceHash = useCallback(async (src: string): Promise<string> => {
-    if (!src) return '';
-    if (refHashCacheRef.current[src]) return refHashCacheRef.current[src];
+  const getCachedReferenceBank = useCallback(async (src: string): Promise<string[]> => {
+    if (!src) return [];
+    if (refBankCacheRef.current[src]) return refBankCacheRef.current[src];
     try {
-      const h = await computeFastDHash(src);
-      if (h.length === 64) {
-        refHashCacheRef.current[src] = h;
+      const bank = await computeReferenceHashBank(src);
+      if (bank.length > 0) {
+        refBankCacheRef.current[src] = bank;
       }
-      return h;
+      return bank;
     } catch {
-      return '';
+      return [];
     }
   }, []);
 
-  // Lightweight throttled live telemetry pulse (every 500ms while camera is active)
+  // 450ms live match telemetry
   useEffect(() => {
+    streakRef.current = 0;
+    setStableStreak(0);
     if (!cameraActive || !activeRefSrc) {
       setLiveSimilarity(null);
-      setLiveDistance(null);
       return;
     }
     let cancelled = false;
     const timer = window.setInterval(async () => {
       if (cancelled) return;
-      const roi = captureLiveRoiCanvas();
-      if (!roi) return;
+      const sqCanvas = captureLiveSquareCanvas();
+      if (!sqCanvas) return;
       try {
-        const [liveHash, refHash] = await Promise.all([
-          computeFastDHash(roi),
-          getCachedReferenceHash(activeRefSrc),
+        const [liveRes, refBank] = await Promise.all([
+          computeDetailedDHash(sqCanvas),
+          getCachedReferenceBank(activeRefSrc),
         ]);
-        if (!cancelled && liveHash.length === 64 && refHash.length === 64) {
-          const dist = hammingDistance(refHash, liveHash);
-          const sim = Math.max(0, Math.round(((64 - dist) / 64) * 100));
-          setLiveDistance(dist);
-          setLiveSimilarity(sim);
+        if (cancelled) return;
+        if (liveRes.contrastStdDev < 12 || liveRes.bits.length !== 256 || refBank.length === 0) {
+          streakRef.current = 0;
+          setStableStreak(0);
+          setLiveSimilarity(0);
+          return;
         }
+        const dist = minBankHammingDistance(refBank, liveRes.bits);
+        const maxDist = getScaledMaxDistance(sandbox.maxHammingDistance, 256);
+        const sim = Math.max(0, Math.round(((256 - dist) / 256) * 100));
+        setLiveSimilarity(sim);
+        if (dist <= maxDist) {
+          streakRef.current = Math.min(5, streakRef.current + 1);
+        } else {
+          streakRef.current = 0;
+        }
+        setStableStreak(streakRef.current);
       } catch {
-        // Ignore transient frame read issues
+        streakRef.current = 0;
+        setStableStreak(0);
       }
-    }, 500);
+    }, 450);
 
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [cameraActive, activeRefSrc, captureLiveRoiCanvas, getCachedReferenceHash]);
+  }, [cameraActive, activeRefSrc, sandbox.maxHammingDistance, captureLiveSquareCanvas, getCachedReferenceBank]);
 
   async function handleVerifyLiveFrame() {
     if (!activeSpot) return;
-    const roi = captureLiveRoiCanvas();
-    if (!roi) {
+    const sqCanvas = captureLiveSquareCanvas();
+    if (!sqCanvas) {
       setFeedback('[X] LIVE SENSOR NOT READY — ENGAGE CAMERA VIEWFINDER FIRST.');
       return;
     }
@@ -267,61 +289,84 @@ export default function ScannerView({
     setFeedback(null);
 
     try {
-      const captureHash = await computeFastDHash(roi);
-      if (captureHash.length !== 64) {
+      const liveRes = await computeDetailedDHash(sqCanvas);
+      if (liveRes.bits.length !== 256) {
         setFeedback('[X] SENSOR READ ERROR — STABILIZE OPTICS & RETRY.');
         return;
       }
 
-      const maxAllowedDist =
-        activeSpot.id === 'admin-sandbox-test-node'
-          ? sandbox.maxHammingDistance
-          : Math.max(18, sandbox.maxHammingDistance || 18);
+      if (liveRes.contrastStdDev < 12) {
+        streakRef.current = 0;
+        setStableStreak(0);
+        setFeedback(
+          '[X] LOW SCENE CONTRAST — AIM AT A DISTINCT ARCHITECTURAL OR ZINE MARKER.'
+        );
+        return;
+      }
 
-      if (activeRefSrc) {
-        const refHash = await getCachedReferenceHash(activeRefSrc);
-        if (refHash.length === 64) {
-          const dist = hammingDistance(refHash, captureHash);
-          const similarity = Math.max(0, Math.round(((64 - dist) / 64) * 100));
+      if (!activeRefSrc) {
+        setFeedback('[X] NO REFERENCE SIGNATURE CONFIGURED FOR THIS NODE.');
+        return;
+      }
 
-          if (dist <= maxAllowedDist) {
-            if (
-              activeSpot.id === 'admin-sandbox-test-node' &&
-              !sandbox.awardPointsInLiveDemo
-            ) {
-              setFeedback(
-                `✓ LIVE SANDBOX MATCH (${similarity}% SIMILARITY, DIST ${dist}/64) — CALIBRATION ONLY (NO PTS)`
-              );
-              return;
-            }
-            onUnlockSpot(activeSpot.id);
-            const pts = hasScanAmplifier
-              ? Math.round(activeSpot.points * 1.25)
-              : activeSpot.points;
-            setFeedback(
-              `✓ LIVE SIGNAL LOCKED (${similarity}% MATCH, DIST ${dist}/64) — +${pts} PTS CREDITED!`
-            );
-            return;
-          } else {
-            setFeedback(
-              `[X] LIVE MISMATCH (${similarity}% SIMILARITY, DIST ${dist}/64 > MAX ${maxAllowedDist}) — ZOOM IN OR ALIGN RETICLE TO TARGET.`
-            );
-            return;
-          }
-        }
+      const refBank = await getCachedReferenceBank(activeRefSrc);
+      if (refBank.length === 0) {
+        setFeedback(
+          '[X] REFERENCE SIGNATURE UNREADABLE (CORS/NETWORK) — USE LOCAL /REFS OR SANDBOX TARGET.'
+        );
+        return;
+      }
+
+      const dist = minBankHammingDistance(refBank, liveRes.bits);
+      const maxAllowedDist = getScaledMaxDistance(sandbox.maxHammingDistance, 256);
+      const similarity = Math.max(0, Math.round(((256 - dist) / 256) * 100));
+      const minRequiredSim = Math.round(((256 - maxAllowedDist) / 256) * 100);
+
+      if (dist > maxAllowedDist) {
+        streakRef.current = 0;
+        setStableStreak(0);
+        setFeedback(
+          `[X] MISMATCH (${similarity}% < ${minRequiredSim}% REQUIRED) — MATCH SQUARE FRAME TO REFERENCE.`
+        );
+        return;
+      }
+
+      if (streakRef.current < 1) {
+        streakRef.current = 1;
+        setStableStreak(1);
+        setFeedback(
+          `[~] PARTIAL LOCK (${similarity}%) — HOLD STEADY & TAP VERIFY AGAIN TO CONFIRM.`
+        );
+        return;
+      }
+
+      if (
+        activeSpot.id === 'admin-sandbox-test-node' &&
+        !sandbox.awardPointsInLiveDemo
+      ) {
+        setFeedback(
+          `✓ VERIFIED 1:1 SQUARE MATCH (${similarity}% SIMILARITY) — CALIBRATION ONLY (NO PTS)`
+        );
+        return;
       }
 
       onUnlockSpot(activeSpot.id);
       const pts = hasScanAmplifier
         ? Math.round(activeSpot.points * 1.25)
         : activeSpot.points;
-      setFeedback(`✓ LIVE OPTIC LOCKED (${activeSpot.band.toUpperCase()}): +${pts} PTS CREDITED`);
+      setFeedback(
+        `✓ VERIFIED 1:1 SIGNAL LOCK (${similarity}% MATCH) — +${pts} PTS CREDITED!`
+      );
     } catch {
       setFeedback('[X] LIVE FRAME DECODE FAILED.');
     } finally {
       setVerifying(false);
     }
   }
+
+  const minRequiredSimilarity = Math.round(
+    ((256 - getScaledMaxDistance(sandbox.maxHammingDistance, 256)) / 256) * 100
+  );
 
   return (
     <div className="space-y-4 font-mono text-[#EAE6DF]">
@@ -375,29 +420,22 @@ export default function ScannerView({
             <div className="text-[11px] text-[#33FF00]">📍 {activeSpot.locationName}</div>
           </div>
 
-          {/* Target Reference Thumbnail */}
+          {/* Side-by-Side / Centered 1:1 Square Reference (Zero Cropping) */}
           {activeRefSrc && (
-            <div className="relative border border-[#33FF00]/60 bg-black overflow-hidden">
-              <img
-                src={activeRefSrc}
-                alt={`Reference marker for ${activeSpot.title}`}
-                loading="lazy"
-                decoding="async"
-                onError={(e) => {
-                  const fallback = activeSpot.referenceImageUrl;
-                  if (fallback && e.currentTarget.src !== fallback) {
-                    e.currentTarget.src = fallback;
-                  }
-                }}
-                className="h-32 w-full object-cover grayscale contrast-125 opacity-90"
-              />
-              <div className="absolute top-1.5 left-1.5 bg-black/85 border border-[#33FF00] px-1.5 py-0.5 text-[9px] font-bold uppercase text-[#33FF00]">
-                {activeSpot.id === 'admin-sandbox-test-node'
-                  ? 'ADMIN SANDBOX REFERENCE // MATCH LIVE'
-                  : 'TARGET MARKER // LIVE SENSOR ONLY'}
+            <div className="border border-[#33FF00]/60 bg-black p-2.5 space-y-1.5">
+              <div className="flex items-center justify-between text-[9px] font-bold uppercase">
+                <span className="text-[#33FF00]">1:1 SQUARE TARGET REFERENCE</span>
+                <span className="text-[#EAE6DF]/80">LOCK &gt;={minRequiredSimilarity}%</span>
               </div>
-              <div className="absolute bottom-1.5 right-1.5 bg-black/85 px-1.5 py-0.5 text-[9px] text-[#EAE6DF]/80">
-                ANTI-SPOOF LIVE DHASH
+              <div className="relative mx-auto aspect-square w-44 sm:w-48 border-2 border-[#33FF00]/70 bg-[#0D0D0D] overflow-hidden">
+                <img
+                  src={activeRefSrc}
+                  alt={`Square reference for ${activeSpot.title}`}
+                  className="h-full w-full object-cover"
+                />
+              </div>
+              <div className="text-center text-[9px] text-[#EAE6DF]/65">
+                Match this exact 1:1 square crop inside the live viewfinder below
               </div>
             </div>
           )}
@@ -406,17 +444,17 @@ export default function ScannerView({
             {activeSpot.riddle}
           </p>
 
-          {/* Live Camera Viewfinder + Zoom Controls */}
+          {/* True 1:1 Square Live Camera Viewfinder */}
           <div className="border-2 border-[#33FF00] bg-black p-2.5 space-y-2.5">
             <div className="flex items-center justify-between text-[10px] font-bold uppercase">
               <span className="text-[#33FF00]">
-                {cameraActive ? '● LIVE OPTIC FEED ACTIVE' : '○ SENSOR STANDBY'}
+                {cameraActive ? '● 1:1 LIVE OPTIC ACTIVE' : '○ SENSOR STANDBY'}
               </span>
               <span className="text-[#EAE6DF]/75">ZOOM: {zoom.toFixed(1)}x</span>
             </div>
 
             {cameraActive ? (
-              <div className="relative aspect-square max-h-64 w-full mx-auto overflow-hidden border border-[#EAE6DF]/40 bg-black">
+              <div className="relative aspect-square w-60 sm:w-64 mx-auto overflow-hidden border-2 border-[#33FF00] bg-black">
                 <video
                   ref={videoRef}
                   playsInline
@@ -428,20 +466,20 @@ export default function ScannerView({
                   }
                   className="h-full w-full object-cover transition-transform duration-150"
                 />
-                {/* Alignment Reticle Overlay */}
-                <div className="pointer-events-none absolute inset-6 border-2 border-dashed border-[#33FF00]/80 flex items-end justify-between p-1.5">
+                {/* Edge-to-edge 1:1 Reticle matching exact capture crop */}
+                <div className="pointer-events-none absolute inset-0 border-2 border-dashed border-[#33FF00]/70 flex items-end justify-between p-1.5">
                   <span className="bg-black/80 px-1.5 py-0.5 text-[9px] font-bold text-[#33FF00]">
-                    ALIGN MARKER IN RETICLE
+                    {stableStreak >= 2 ? '✓ SIGNAL LOCKED' : '1:1 FRAME'}
                   </span>
                   {liveSimilarity !== null && (
                     <span
                       className={`px-1.5 py-0.5 text-[9px] font-bold ${
-                        liveSimilarity >= 70
+                        liveSimilarity >= minRequiredSimilarity
                           ? 'bg-[#33FF00] text-[#0D0D0D]'
                           : 'bg-black/85 text-[#EAE6DF]'
                       }`}
                     >
-                      LOCK: {liveSimilarity}% ({liveDistance}/64)
+                      {liveSimilarity}% / {minRequiredSimilarity}%
                     </span>
                   )}
                 </div>
@@ -449,14 +487,14 @@ export default function ScannerView({
             ) : (
               <div className="border border-dashed border-[#EAE6DF]/35 bg-[#0D0D0D] p-4 text-center space-y-2">
                 <div className="text-[11px] text-[#EAE6DF]/75">
-                  Gallery uploads disabled to prevent photo counterfeits. Engage live camera to scan on-site marker.
+                  Gallery uploads disabled to prevent photo counterfeits. Engage 1:1 square live viewfinder to scan marker.
                 </div>
                 <button
                   type="button"
                   onClick={startCamera}
                   className="border-2 border-[#33FF00] bg-[#33FF00] px-3 py-1.5 text-xs font-bold uppercase text-[#0D0D0D]"
                 >
-                  [📷 ENGAGE LIVE VIEWFINDER]
+                  [📷 ENGAGE 1:1 VIEWFINDER]
                 </button>
               </div>
             )}
@@ -500,7 +538,7 @@ export default function ScannerView({
                     onClick={handleVerifyLiveFrame}
                     className="col-span-2 border-2 border-[#EAE6DF] bg-[#33FF00] p-2 text-xs font-bold uppercase text-[#0D0D0D] active:translate-y-px"
                   >
-                    {verifying ? '>> SAMPLING DHASH...' : '[⚡ LOCK & VERIFY LIVE FRAME]'}
+                    {verifying ? '>> SAMPLING 256-BIT DHASH...' : '[⚡ LOCK & VERIFY 1:1 FRAME]'}
                   </button>
                   <button
                     type="button"
@@ -525,6 +563,8 @@ export default function ScannerView({
               className={`border p-2 text-xs font-bold ${
                 feedback.startsWith('✓')
                   ? 'border-[#33FF00] bg-black text-[#33FF00]'
+                  : feedback.startsWith('[~]')
+                  ? 'border-amber-400 bg-black text-amber-300'
                   : 'border-[#D9381E] bg-black text-[#D9381E]'
               }`}
             >

@@ -10,7 +10,7 @@ import {
   saveCustomLandmarks,
   saveCustomMarketItems,
 } from '../utils/supabaseClient';
-import { computeFastDHash } from '../utils/scannerHash';
+import { computeFastDHash, cropFileToSquareDataUrl } from '../utils/scannerHash';
 import { CommunityDuty, Landmark, MarketItem as SharedMarketItem } from '../types';
 
 
@@ -298,23 +298,14 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
   const handleBandNodePhoto = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const hash = await computeFastDHash(file);
-    setBandNodeHash(hash);
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      const scale = Math.min(1, 320 / Math.max(img.width, img.height));
-      canvas.width = Math.round(img.width * scale);
-      canvas.height = Math.round(img.height * scale);
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        setBandNodePhoto(canvas.toDataURL('image/jpeg', 0.65));
-      }
-      URL.revokeObjectURL(url);
-    };
-    img.src = url;
+    const { dataUrl, wasCropped } = await cropFileToSquareDataUrl(file, 360, 0.78);
+    if (!dataUrl) return;
+    const dHash = await computeFastDHash(dataUrl);
+    setBandNodeHash(dHash);
+    setBandNodePhoto(dataUrl);
+    if (wasCropped) {
+      setMarketNotice('⚠ NON-SQUARE TARGET PHOTO AUTO-CROPPED TO CENTER 1:1 SQUARE.');
+    }
   };
 
   const handleMintBandNode = (e: React.FormEvent) => {
@@ -774,11 +765,21 @@ export const PassAndMarket: React.FC<PassAndMarketProps> = ({
                     onChange={(e) => setBandNodeRiddle(e.target.value)}
                     className="w-full border-2 border-[#EAE6DF] bg-black p-2 text-xs text-[#EAE6DF]"
                   />
-                  <div className="flex items-center justify-between gap-2 border border-[#EAE6DF]/40 bg-black p-2 text-[10px]">
-                    <span className="text-[#33FF00]">
-                      {bandNodePhoto ? '✓ TARGET PHOTO + DHASH LOCKED' : 'UPLOAD TARGET PHOTO:'}
-                    </span>
-                    <input type="file" accept="image/*" onChange={handleBandNodePhoto} />
+                  <div className="border border-[#EAE6DF]/40 bg-black p-2 text-[10px] space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[#33FF00]">
+                        {bandNodePhoto ? '✓ 1:1 TARGET PHOTO + 256-BIT DHASH LOCKED' : 'UPLOAD TARGET PHOTO:'}
+                      </span>
+                      <input type="file" accept="image/*" onChange={handleBandNodePhoto} />
+                    </div>
+                    <div className="text-[9px] text-amber-300/90">
+                      ⚠ 1:1 SQUARE ASPECT RATIO REQUIRED — NON-SQUARE PHOTOS ARE AUTO-CROPPED TO CENTER 1:1.
+                    </div>
+                    {bandNodePhoto && (
+                      <div className="mx-auto aspect-square w-28 border border-[#33FF00]/70 overflow-hidden">
+                        <img src={bandNodePhoto} alt="1:1 band node preview" className="h-full w-full object-cover" />
+                      </div>
+                    )}
                   </div>
                   <button
                     type="submit"
